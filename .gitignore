@@ -1,0 +1,25 @@
+# Mbed OS build outputs
+BUILD/
+*.bin
+*.hex
+*.elf
+*.map
+*.o
+*.d
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+*.tmp
+*.log
+
+# Temporary files
+mbed_app.json.backup
+.mbedignore
