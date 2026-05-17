@@ -51,6 +51,12 @@ cp -X BUILD/NUCLEO_F446RE/GCC_ARM/*.bin /Volumes/NOD_F446RE/
    ```
    screen /dev/cu.usbmodem103 115200
    ```
+## PlatformIO編譯燒錄說明
+
+由於本工作區包含多個實驗專案，每次要執行或編譯特定程式碼時，請務必先修改最外層的 `platformio.ini` 設定檔。
+  
+請將設定檔中的 `src_dir` 修改為**你今天想要編譯與燒錄的資料夾名稱**
+（例如：`src_dir = Test_NUCLEO_F446RE`）。修改完成並存檔後，再按下編譯或上傳（Upload）按鈕。
 
 ## Mbed OS知識
 
