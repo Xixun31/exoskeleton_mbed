@@ -30,6 +30,6 @@ int main() {
         // --- 神奇的整數拆解法結束 ---
 
         pc.write(buffer, len);
-        thread_sleep_for(100); 
+        thread_sleep_for(50); 
     }
 }
