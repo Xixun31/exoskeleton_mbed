@@ -25,4 +25,4 @@ mbed_app.json.backup
 .mbedignore
 
 # Ignore the Mbed OS source code directory
-# mbed-os/
+mbed-os/
