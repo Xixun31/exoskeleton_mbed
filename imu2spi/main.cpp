@@ -1,5 +1,5 @@
 #include "mbed.h"
-#include "MTi2.h"
+#include "imu2spi\MTi2\MTi2.h"
 
 // ================= 獨立雙 SPI 設定 =================
 // IMU1 使用 SPI3 (全接 Arduino 母孔，不需與其他訊號線共用插孔)

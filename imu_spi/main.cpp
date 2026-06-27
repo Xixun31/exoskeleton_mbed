@@ -1,5 +1,5 @@
 #include "mbed.h"
-#include "MTi2.h"
+#include "MTi2/MTi2.h"
 
 // ================= SPI 設定 =================
 // Frequency: 1MHz, MOSI: PB_15, MISO: PB_14, SCLK: PB_13, CS: PB_1
