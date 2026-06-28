@@ -20,10 +20,22 @@ int main() {
         // 格式化輸出以與 python/stm32_imu_uart.py 相容：
         // 歐拉角 (deg), 加速度 (m/s^2), 角速度 (deg/s)
         // 註：IMU.omega 原本為 rad/s，乘上 57.2958f 轉成 deg/s
-        printf("R:%6.2f P:%6.2f Y:%6.2f | aX:%5.2f aY:%5.2f aZ:%5.2f | gX:%6.2f gY:%6.2f gZ:%6.2f\n",
-               IMU.euler[0], IMU.euler[1], IMU.euler[2],
-               IMU.accel[0], IMU.accel[1], IMU.accel[2],
-               IMU.omega[0] * 57.2958f, IMU.omega[1] * 57.2958f, IMU.omega[2] * 57.2958f);
+        /*printf("R:%.2f P:%.2f Y:%.2f | aX:%.2f aY:%.2f aZ:%.2f | gX:%.2f gY:%.2f gZ:%.2f\n",
+            IMU.euler[0], IMU.euler[1], IMU.euler[2],
+            IMU.accel[0], IMU.accel[1], IMU.accel[2],
+            IMU.omega[0] * 57.2958f, IMU.omega[1] * 57.2958f, IMU.omega[2] * 57.2958f);*/
+        /*// 把所有的數值強制加上 (int) 轉成整數，避開 Mbed OS 的浮點數限制
+        printf("R:%d P:%d Y:%d | aX:%d aY:%d aZ:%d | gX:%d gY:%d gZ:%d\n",
+               (int)IMU.euler[0], (int)IMU.euler[1], (int)IMU.euler[2],
+               (int)IMU.accel[0], (int)IMU.accel[1], (int)IMU.accel[2],
+               (int)(IMU.omega[0] * 57.2958f), (int)(IMU.omega[1] * 57.2958f), (int)(IMU.omega[2] * 57.2958f));*/
+        // 在 main.cpp 的 while 迴圈內
+        
+        // 必須嚴格保持這個格式，確保每個 Hex 數值前面都有冒號，且總共有 9 個數值
+        printf("R:%08X P:%08X Y:%08X A:%08X A:%08X A:%08X G:%08X G:%08X G:%08X\n", 
+               *(uint32_t*)&IMU.euler[0], *(uint32_t*)&IMU.euler[1], *(uint32_t*)&IMU.euler[2],
+               *(uint32_t*)&IMU.accel[0], *(uint32_t*)&IMU.accel[1], *(uint32_t*)&IMU.accel[2],
+               *(uint32_t*)&IMU.omega[0], *(uint32_t*)&IMU.omega[1], *(uint32_t*)&IMU.omega[2]);
 
         // 閃爍 LED1 指示運行狀態
         led = !led;

@@ -40,7 +40,7 @@ private:
   imu_data gry[3];
 
 public:
-  MTi2Class(int freq, PinName MISO, PinName MOSI, PinName SCLK, PinName CS);
+  MTi2Class(int freq,PinName MOSI,PinName MISO,PinName SCLK,PinName CS);
   //~MTi2Class();
   void MTi2_Init();
   void SendOpcode(uint8_t Opcode);

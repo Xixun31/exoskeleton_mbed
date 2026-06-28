@@ -16,7 +16,7 @@ void MTi2Class::MTi2_Init(){
     ctrl_len = 3;
     ctrlBuf[0] = 0x10; // GoToMeasurement
     ctrlBuf[1] = 0x00; // Length
-    ctrlBuf[2] = 0xF1; // Checksum
+    ctrlBuf[2] = 0xF0; // Checksum
     ControlPipe();
 }
 
@@ -112,13 +112,20 @@ void MTi2Class::ReadData(){
     PipeStatus();//Check pipe statue : measurement size
     wait_us(10);
     
-    printf("[SPI-Debug] PipeStatus: %02X %02X %02X %02X | nSize: %d, mSize: %d\n", 
+    /*printf("[SPI-Debug] PipeStatus: %02X %02X %02X %02X | nSize: %d, mSize: %d\n", 
            buffer[0], buffer[1], buffer[2], buffer[3], notificationSize, measurementSize);
            
     if (notificationSize > 0) {
         NotificationPipe();
         wait_us(10);
-    }
+    }*/
+
+    /*if (buffer[0] == 0x36) {
+        // 這裡可以印，因為這代表發生了異常，我們需要知道
+        printf("[SPI-Sync-Error] Detected 0x36 in PipeStatus. Resetting...\n");
+        measurementSize = 0; 
+        return;
+    }*/
     
     if (measurementSize == 0) {
         return;
@@ -139,7 +146,7 @@ void MTi2Class::ReadData(){
                 
                 uint8_t* content = &buffer[i+3];
                 
-                if (xdi == 0x2030 && size == 12) {        
+                /*if (xdi == 0x2030 && size == 12) {        
                     eul[0].data1 = (content[0]<<24) | (content[1]<<16) | (content[2]<<8) | content[3];     
                     eul[1].data1 = (content[4]<<24) | (content[5]<<16) | (content[6]<<8) | content[7]; 
                     eul[2].data1 = (content[8]<<24) | (content[9]<<16) | (content[10]<<8) | content[11]; 
@@ -162,8 +169,30 @@ void MTi2Class::ReadData(){
                     omega[0] = gry[0].data2;
                     omega[1] = gry[1].data2;
                     omega[2] = gry[2].data2;
-                }
+                }*/
+                // 定義一個輔助函數來處理 Byte Swap 並轉換為 float
+                auto swap_and_cast = [](uint8_t* data) -> float {
+                    uint32_t val = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
+                    float f;
+                    memcpy(&f, &val, 4);
+                    return f;
+                };
                 
+                if (xdi == 0x2030 && size == 12) {        
+                    euler[0] = swap_and_cast(&content[0]);
+                    euler[1] = swap_and_cast(&content[4]);
+                    euler[2] = swap_and_cast(&content[8]);
+                }
+                else if (xdi == 0x4020 && size == 12) {   
+                    accel[0] = swap_and_cast(&content[0]);
+                    accel[1] = swap_and_cast(&content[4]);
+                    accel[2] = swap_and_cast(&content[8]);
+                }
+                else if (xdi == 0x8020 && size == 12) {   
+                    omega[0] = swap_and_cast(&content[0]);
+                    omega[1] = swap_and_cast(&content[4]);
+                    omega[2] = swap_and_cast(&content[8]);
+                }
                 i += (3 + size);
             }
         }
