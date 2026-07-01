@@ -107,9 +107,12 @@ cp ./BUILD/NUCLEO_F446RE/GCC_ARM/*.bin /media/xixun/NOD_F446RE/ && sync
 
 ## 模塊說明
 
-- `bluetooth/`: 藍牙通信模組
-- `encoder/`: 編碼器模組
-- `IMU/`: 慣性測量單元模組
-- `imu_uart/`: UART 通信的 IMU 模組
-- `mbed-os5-passive/`: 被動模式下的 Mbed OS 5
-- `Test_NUCLEO_F446RE/`: 測試模組
+- [bluetooth/](file:///home/xixun/project/mbed/bluetooth): 藍牙通信模組。
+- [encoder/](file:///home/xixun/project/mbed/encoder): 編碼器模組。
+- [flex_sensor/](file:///home/xixun/project/mbed/flex_sensor): 彎曲感測器模組。
+- [IMU/](file:///home/xixun/project/mbed/IMU): 整合了單 SPI IMU 與編碼器的主專案。
+- [imu_uart/](file:///home/xixun/project/mbed/imu_uart): 讀取單 UART IMU 數據專案。
+- [imu_dual_uart/](file:///home/xixun/project/mbed/imu_dual_uart): 讀取雙 UART IMU 數據專案（中斷回呼設計）。
+- [imu_spi/](file:///home/xixun/project/mbed/imu_spi) / [imu2spi/](file:///home/xixun/project/mbed/imu2spi): 讀取單 SPI IMU 數據專案。
+- [mbed-os5-passive/](file:///home/xixun/project/mbed/mbed-os5-passive): 被動模式下的 Mbed OS 5。
+- [Test_NUCLEO_F446RE/](file:///home/xixun/project/mbed/Test_NUCLEO_F446RE): 基礎硬體測試專案。
