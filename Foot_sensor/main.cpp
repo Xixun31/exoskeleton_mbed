@@ -1,265 +1,204 @@
 #include "mbed.h"
+#include <stdlib.h>
+#include <string.h>
 #include <chrono>
 
-// ============================================================
-// UART
-//
-// ESP32 GPIO17 TX -> STM32 PA10 RX
-// ESP32 GND       -> STM32 GND
-//
-// PA9 是 STM32 TX，這次其實不用接
-// ============================================================
-
 BufferedSerial esp32(PA_9, PA_10, 115200);
-
 BufferedSerial pc(USBTX, USBRX, 115200);
-
-
-// ============================================================
-// 感測器 frame
-// ============================================================
-
-const int FRAME_SIZE = 39;
-const int PRESSURE_COUNT = 18;
-
-uint8_t frame[FRAME_SIZE];
-
-int frame_index = 0;
-
-
-// ============================================================
-// 測試統計
-// ============================================================
-
-const int TOTAL_PACKETS = 500;
-
 Timer timer;
 
 bool testing = false;
+int target_hz = 0;
 
-int good_frames = 0;
-int bad_checksum = 0;
+int expected_num = 1;
+int received_count = 0;
+int lost_count = 0;
+int duplicate_count = 0;
 
-long long max_interval_ms = 0;
-long long total_interval_ms = 0;
+int first_sequence = 0;
+int last_sequence = 0;
 
-long long last_frame_time_ms = 0;
+long long last_packet_time_us = 0;
+long long total_interval_us = 0;
+long long max_interval_us = 0;
+long long max_lag_us = 0;
 
-
-// ============================================================
-// Timer
-// ============================================================
-
-long long get_elapsed_ms()
+long long get_elapsed_us()
 {
     return std::chrono::duration_cast<
-        std::chrono::milliseconds
-    >(
-        timer.elapsed_time()
-    ).count();
+        std::chrono::microseconds
+    >(timer.elapsed_time()).count();
 }
 
-
-// ============================================================
-// Checksum
-//
-// byte[38] =
-// byte[0] ~ byte[37] 加總後低8位
-// ============================================================
-
-bool check_checksum(uint8_t *data)
+void print_x100(long long value_x100)
 {
-    uint16_t sum = 0;
+    long long integer_part = value_x100 / 100;
+    long long decimal_part = value_x100 % 100;
 
-    for (int i = 0; i < 38; i++)
-    {
-        sum += data[i];
-    }
+    if (decimal_part < 0)
+        decimal_part = -decimal_part;
 
-    uint8_t checksum =
-        (uint8_t)(sum & 0xFF);
-
-    return checksum == data[38];
+    printf("%lld.%02lld", integer_part, decimal_part);
 }
 
-
-// ============================================================
-// 印出一個完整 frame
-// ============================================================
-
-void print_frame(uint8_t *data)
+void print_us_as_ms_x100(long long value_us)
 {
-    // --------------------------------------------------------
-    // 左右腳
-    // --------------------------------------------------------
-
-    printf("Foot=");
-
-    if (data[1] == 0x01)
-    {
-        printf("LEFT");
-    }
-    else if (data[1] == 0x02)
-    {
-        printf("RIGHT");
-    }
-    else
-    {
-        printf("UNKNOWN");
-    }
-
-
-    printf(" | ");
-
-
-    // --------------------------------------------------------
-    // 18個 pressure
-    //
-    // 每點2 bytes：
-    // High byte + Low byte
-    // --------------------------------------------------------
-
-    for (int i = 0; i < PRESSURE_COUNT; i++)
-    {
-        int index =
-            2 + i * 2;
-
-
-        uint16_t pressure =
-            ((uint16_t)data[index] << 8)
-            |
-            data[index + 1];
-
-
-        printf(
-            "P%d=%u",
-            i + 1,
-            pressure
-        );
-
-
-        if (i != PRESSURE_COUNT - 1)
-        {
-            printf(", ");
-        }
-    }
-
-    printf("\r\n");
+    long long ms_x100 = value_us / 10;
+    print_x100(ms_x100);
 }
 
+void reset_test()
+{
+    testing = false;
 
-// ============================================================
-// 印最後統計
-// ============================================================
+    expected_num = 1;
+    received_count = 0;
+    lost_count = 0;
+    duplicate_count = 0;
 
-void print_result()
+    first_sequence = 0;
+    last_sequence = 0;
+
+    last_packet_time_us = 0;
+    total_interval_us = 0;
+    max_interval_us = 0;
+    max_lag_us = 0;
+
+    timer.stop();
+    timer.reset();
+}
+
+void print_result(int sent_total)
 {
     timer.stop();
 
-    long long elapsed_ms =
-        get_elapsed_ms();
+    long long elapsed_us = get_elapsed_us();
 
-
-    int hz_x100 = 0;
-
-    if (
-        elapsed_ms > 0 &&
-        good_frames > 1
-    )
+    if (sent_total > 0 && last_sequence < sent_total)
     {
-        hz_x100 =
-            (int)(
-                ((long long)
-                (good_frames - 1)
-                * 100000LL)
-                /
-                elapsed_ms
-            );
+        lost_count += sent_total - last_sequence;
     }
 
+    long long loss_rate_x100 = 0;
 
-    long long avg_interval_ms = 0;
-
-    if (good_frames > 1)
+    if (sent_total > 0)
     {
-        avg_interval_ms =
-            total_interval_ms
-            /
-            (good_frames - 1);
+        loss_rate_x100 =
+            ((long long)lost_count * 10000LL) / sent_total;
     }
 
+    long long receive_hz_x100 = 0;
+
+    if (elapsed_us > 0 && received_count > 1)
+    {
+        receive_hz_x100 =
+            ((long long)(received_count - 1) * 100000000LL)
+            / elapsed_us;
+    }
+
+    long long avg_interval_us = 0;
+
+    if (received_count > 1)
+    {
+        avg_interval_us =
+            total_interval_us / (received_count - 1);
+    }
 
     printf("\r\n");
     printf("========================================\r\n");
-    printf("Sensor -> ESP32 -> STM32 測試結果\r\n");
+    printf("PC BLE -> ESP32 -> STM32 測試結果\r\n");
     printf("========================================\r\n");
+    printf("目標頻率       : %d Hz\r\n", target_hz);
+    printf("理論總包數     : %d\r\n", sent_total);
+    printf("實際收到       : %d\r\n", received_count);
+    printf("掉包數         : %d\r\n", lost_count);
+    printf("重複/亂序包    : %d\r\n", duplicate_count);
+
+    printf("掉包率         : ");
+    print_x100(loss_rate_x100);
+    printf(" %%\r\n");
+
+    printf("實際接收頻率   : ");
+    print_x100(receive_hz_x100);
+    printf(" Hz\r\n");
 
     printf(
-        "有效封包       : %d\r\n",
-        good_frames
+        "總接收時間     : %lld.%06lld s\r\n",
+        elapsed_us / 1000000,
+        elapsed_us % 1000000
     );
 
-    printf(
-        "Checksum Error : %d\r\n",
-        bad_checksum
-    );
+    printf("平均封包間隔   : ");
+    print_us_as_ms_x100(avg_interval_us);
+    printf(" ms\r\n");
 
-    printf(
-        "總接收時間     : %lld.%03lld s\r\n",
-        elapsed_ms / 1000,
-        elapsed_ms % 1000
-    );
+    printf("最大封包間隔   : ");
+    print_us_as_ms_x100(max_interval_us);
+    printf(" ms\r\n");
 
-
-    printf(
-        "實際接收頻率   : %d.%02d Hz\r\n",
-        hz_x100 / 100,
-        hz_x100 % 100
-    );
-
-
-    printf(
-        "平均封包間隔   : %lld ms\r\n",
-        avg_interval_ms
-    );
-
-
-    printf(
-        "最大封包間隔   : %lld ms\r\n",
-        max_interval_ms
-    );
-
+    printf("最大累積落後   : ");
+    print_us_as_ms_x100(max_lag_us);
+    printf(" ms\r\n");
 
     printf("========================================\r\n");
+    printf("\r\n等待下一輪 START...\r\n");
+
+    reset_test();
 }
 
-
-// ============================================================
-// 收到完整39 bytes
-// ============================================================
-
-void process_frame()
+void process_line(char *line)
 {
-    // ========================================================
-    // checksum
-    // ========================================================
-
-    if (!check_checksum(frame))
+    if (strncmp(line, "START,", 6) == 0)
     {
-        bad_checksum++;
+        int hz = atoi(line + 6);
 
-        printf(
-            "BAD CHECKSUM #%d\r\n",
-            bad_checksum
-        );
+        if (hz <= 0)
+        {
+            printf("START 頻率無效\r\n");
+            return;
+        }
+
+        reset_test();
+        target_hz = hz;
+
+        printf("\r\n");
+        printf("========================================\r\n");
+        printf("收到 START\r\n");
+        printf("目標頻率 : %d Hz\r\n", target_hz);
+        printf("========================================\r\n");
 
         return;
     }
 
+    if (strncmp(line, "END,", 4) == 0)
+    {
+        int sent_total = atoi(line + 4);
 
-    // ========================================================
-    // 第一個有效 frame
-    // ========================================================
+        if (testing)
+        {
+            print_result(sent_total);
+        }
+        else
+        {
+            printf("收到 END，但尚未收到測試封包\r\n");
+        }
+
+        return;
+    }
+
+    size_t len = strlen(line);
+
+    if (len != 38)
+    {
+        return;
+    }
+
+    int current_num = atoi(line);
+
+    if (current_num <= 0)
+    {
+        return;
+    }
 
     if (!testing)
     {
@@ -268,221 +207,114 @@ void process_frame()
 
         testing = true;
 
-        last_frame_time_ms = 0;
+        first_sequence = current_num;
+        expected_num = current_num;
+        last_packet_time_us = 0;
 
-        printf("\r\n");
-        printf("收到第一個完整 frame，開始計時\r\n");
+        printf(
+            "收到第一包 #%d，開始計時\r\n",
+            current_num
+        );
     }
 
+    long long now_us = get_elapsed_us();
 
-    // ========================================================
-    // 時間統計
-    // ========================================================
-
-    long long now_ms =
-        get_elapsed_ms();
-
-
-    if (good_frames > 0)
+    if (current_num > expected_num)
     {
-        long long interval_ms =
-            now_ms -
-            last_frame_time_ms;
-
-
-        total_interval_ms +=
-            interval_ms;
-
-
-        if (
-            interval_ms >
-            max_interval_ms
-        )
-        {
-            max_interval_ms =
-                interval_ms;
-        }
+        int missing = current_num - expected_num;
+        lost_count += missing;
     }
-
-
-    last_frame_time_ms =
-        now_ms;
-
-
-    good_frames++;
-
-
-    // ========================================================
-    // 印 pressure
-    // ========================================================
-
-    printf(
-        "[Frame %d] ",
-        good_frames
-    );
-
-    print_frame(frame);
-
-
-    // ========================================================
-    // 500包完成
-    // ========================================================
-
-    if (
-        good_frames >=
-        TOTAL_PACKETS
-    )
+    else if (current_num < expected_num)
     {
-        print_result();
-
-
-        // 停在這裡
-        while (true)
-        {
-            ThisThread::sleep_for(
-                1s
-            );
-        }
-    }
-}
-
-
-// ============================================================
-// 一個 byte 一個 byte餵進 parser
-// ============================================================
-
-void parse_byte(uint8_t b)
-{
-    // ========================================================
-    // 等待 AA
-    // ========================================================
-
-    if (frame_index == 0)
-    {
-        if (b == 0xAA)
-        {
-            frame[0] = b;
-
-            frame_index = 1;
-        }
-
+        duplicate_count++;
         return;
     }
 
-
-    // ========================================================
-    // 第二 byte 必須 01 或 02
-    // ========================================================
-
-    if (frame_index == 1)
+    if (received_count > 0)
     {
-        if (
-            b == 0x01 ||
-            b == 0x02
-        )
+        long long interval_us =
+            now_us - last_packet_time_us;
+
+        total_interval_us += interval_us;
+
+        if (interval_us > max_interval_us)
         {
-            frame[1] = b;
-
-            frame_index = 2;
+            max_interval_us = interval_us;
         }
-        else if (b == 0xAA)
-        {
-            // 又遇到新的 AA
-            // 保留作為下一個 frame 開頭
-
-            frame[0] = 0xAA;
-
-            frame_index = 1;
-        }
-        else
-        {
-            frame_index = 0;
-        }
-
-        return;
     }
 
+    last_packet_time_us = now_us;
 
-    // ========================================================
-    // 收剩下的 bytes
-    // ========================================================
+    received_count++;
+    last_sequence = current_num;
+    expected_num = current_num + 1;
 
-    frame[frame_index] = b;
-
-    frame_index++;
-
-
-    // ========================================================
-    // 收滿39 bytes
-    // ========================================================
-
-    if (frame_index == FRAME_SIZE)
+    if (target_hz > 0)
     {
-        process_frame();
+        long long theoretical_us =
+            ((long long)(current_num - first_sequence)
+             * 1000000LL)
+            / target_hz;
 
-        frame_index = 0;
+        long long lag_us =
+            now_us - theoretical_us;
+
+        if (lag_us > max_lag_us)
+        {
+            max_lag_us = lag_us;
+        }
+    }
+
+    if (received_count % 100 == 0)
+    {
+        printf(
+            "[RX %d] Seq=%d Loss=%d\r\n",
+            received_count,
+            current_num,
+            lost_count
+        );
     }
 }
-
-
-// ============================================================
-// main
-// ============================================================
 
 int main()
 {
     esp32.set_blocking(false);
 
-
     printf("\r\n");
     printf("========================================\r\n");
-    printf("Sensor -> ESP32 -> STM32\r\n");
-    printf("39-byte Pressure Sensor Receiver\r\n");
+    printf("PC BLE -> ESP32 -> STM32\r\n");
+    printf("39-byte Bandwidth Receiver\r\n");
     printf("========================================\r\n");
+    printf("UART: PA10 RX, 115200 baud\r\n");
+    printf("等待 START...\r\n");
 
-    printf(
-        "UART: PA10 RX, 115200 baud\r\n"
-    );
-
-    printf(
-        "等待 ESP32 傳送感測器資料...\r\n"
-    );
-
-
-    // ========================================================
-    // 暫存 UART 一次讀到的資料
-    //
-    // 注意：
-    // ESP32 雖然 write(frame, 39)
-    // STM32 read() 不保證一次就是39 bytes
-    // 所以一次最多讀64，再逐byte解析
-    // ========================================================
-
-    uint8_t rx_buffer[64];
-
+    char rx_buf[64];
+    size_t rx_idx = 0;
 
     while (true)
     {
         if (esp32.readable())
         {
-            ssize_t count =
-                esp32.read(
-                    rx_buffer,
-                    sizeof(rx_buffer)
-                );
+            char c;
 
-
-            if (count > 0)
+            if (esp32.read(&c, 1) > 0)
             {
-                for (
-                    ssize_t i = 0;
-                    i < count;
-                    i++
-                )
+                if (c == '\n')
                 {
-                    parse_byte(
-                        rx_buffer[i]
-                    );
+                    rx_buf[rx_idx] = '\0';
+                    process_line(rx_buf);
+                    rx_idx = 0;
+                }
+                else if (c != '\r')
+                {
+                    if (rx_idx < sizeof(rx_buf) - 1)
+                    {
+                        rx_buf[rx_idx++] = c;
+                    }
+                    else
+                    {
+                        rx_idx = 0;
+                    }
                 }
             }
         }
