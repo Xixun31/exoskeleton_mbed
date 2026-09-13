@@ -3,71 +3,110 @@
 
 // ============================================================
 // UART
-//
 // ESP32 GPIO17 TX -> STM32 PA10 RX
 // ESP32 GND       -> STM32 GND
-//
-// PA9 是 STM32 TX，這次其實不用接
+// PA9 是 STM32 TX，目前不用接
 // ============================================================
-
 BufferedSerial esp32(PA_9, PA_10, 115200);
-
 BufferedSerial pc(USBTX, USBRX, 115200);
 
-
 // ============================================================
-// 感測器 frame
+// 感測器封包
+// byte[0]  = 0xAA
+// byte[1]  = 0x01 LEFT / 0x02 RIGHT
+// byte[2]~byte[37] = 18 點壓力，每點 2 bytes (High + Low)
+// byte[38] = checksum
 // ============================================================
-
 const int FRAME_SIZE = 39;
 const int PRESSURE_COUNT = 18;
 
 uint8_t frame[FRAME_SIZE];
-
 int frame_index = 0;
 
-
 // ============================================================
-// 測試統計
+// 計時
 // ============================================================
-
-const int TOTAL_PACKETS = 500;
-
 Timer timer;
-
-bool testing = false;
-
-int good_frames = 0;
-int bad_checksum = 0;
-
-long long max_interval_ms = 0;
-long long total_interval_ms = 0;
-
-long long last_frame_time_ms = 0;
-
-
-// ============================================================
-// Timer
-// ============================================================
+bool timer_started = false;
 
 long long get_elapsed_ms()
 {
-    return std::chrono::duration_cast<
-        std::chrono::milliseconds
-    >(
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
         timer.elapsed_time()
     ).count();
 }
 
+// ============================================================
+// 18 個感測區域幾何中心（AutoCAD 世界座標，mm）
+// ============================================================
+const float sensor_x[PRESSURE_COUNT] = {
+    1943.9325f, 1940.0133f, 1973.6715f, 1972.9752f,
+    1965.7372f, 1957.7049f, 1963.0637f, 1955.6792f,
+    1995.8721f, 1996.5690f, 1983.1920f, 1980.9491f,
+    1982.3130f, 1970.9490f, 2000.9966f, 2003.7015f,
+    2001.4963f, 1988.7695f
+};
+
+const float sensor_y[PRESSURE_COUNT] = {
+    2600.1604f, 2637.9524f, 2444.2083f, 2482.2769f,
+    2521.7471f, 2561.9473f, 2599.0265f, 2642.2744f,
+    2444.2212f, 2482.2769f, 2520.6611f, 2559.8462f,
+    2599.0265f, 2641.6030f, 2521.0309f, 2560.0963f,
+    2597.5737f, 2633.6218f
+};
+
+// 之後決定腳跟原點後改這裡
+float origin_x = 0.0f;
+float origin_y = 0.0f;
+
+// 如果上面這組座標是「右腳」CAD，而你希望左腳用相同身體座標系鏡射，
+// 把這個改成 true。若左右腳各自使用自己的局部座標系，保持 false。
+const bool MIRROR_LEFT_X = false;
+
+// 空載雜訊門檻（先暫定 50 g）
+const float FORCE_THRESHOLD = 50.0f;
 
 // ============================================================
-// Checksum
-//
-// byte[38] =
-// byte[0] ~ byte[37] 加總後低8位
+// COP 結果
 // ============================================================
+struct COPResult
+{
+    bool valid;
+    float x;
+    float y;
+    float total_force;
+};
 
-bool check_checksum(uint8_t *data)
+// ============================================================
+// 每一隻腳各自保存最新一筆資料
+// ============================================================
+struct FootData
+{
+    uint16_t pressure[PRESSURE_COUNT];
+
+    bool cop_valid;
+    float cop_x;
+    float cop_y;
+    float total_force;
+
+    long long timestamp_ms;
+    long long last_timestamp_ms;
+    long long total_interval_ms;
+    long long max_interval_ms;
+
+    unsigned long frame_count;
+};
+
+FootData left_foot = {};
+FootData right_foot = {};
+
+unsigned long total_good_frames = 0;
+unsigned long bad_checksum = 0;
+
+// ============================================================
+// checksum
+// ============================================================
+bool check_checksum(const uint8_t *data)
 {
     uint16_t sum = 0;
 
@@ -76,358 +115,62 @@ bool check_checksum(uint8_t *data)
         sum += data[i];
     }
 
-    uint8_t checksum =
-        (uint8_t)(sum & 0xFF);
-
+    uint8_t checksum = (uint8_t)(sum & 0xFF);
     return checksum == data[38];
 }
 
-
-// ============================================================
-// 印出一個完整 frame
-// ============================================================
-
-void print_frame(uint8_t *data)
-{
-    // --------------------------------------------------------
-    // 左右腳
-    // --------------------------------------------------------
-
-    printf("Foot=");
-
-    if (data[1] == 0x01)
-    {
-        printf("LEFT");
-    }
-    else if (data[1] == 0x02)
-    {
-        printf("RIGHT");
-    }
-    else
-    {
-        printf("UNKNOWN");
-    }
-
-
-    printf(" | ");
-
-
-    // --------------------------------------------------------
-    // 18個 pressure
-    //
-    // 每點2 bytes：
-    // High byte + Low byte
-    // --------------------------------------------------------
-
-    for (int i = 0; i < PRESSURE_COUNT; i++)
-    {
-        int index =
-            2 + i * 2;
-
-
-        uint16_t pressure =
-            ((uint16_t)data[index] << 8)
-            |
-            data[index + 1];
-
-
-        printf(
-            "P%d=%u",
-            i + 1,
-            pressure
-        );
-
-
-        if (i != PRESSURE_COUNT - 1)
-        {
-            printf(", ");
-        }
-    }
-
-    printf("\r\n");
-}
-
-
-// ============================================================
-// 印最後統計
-// ============================================================
-
-void print_result()
-{
-    timer.stop();
-
-    long long elapsed_ms =
-        get_elapsed_ms();
-
-
-    int hz_x100 = 0;
-
-    if (
-        elapsed_ms > 0 &&
-        good_frames > 1
-    )
-    {
-        hz_x100 =
-            (int)(
-                ((long long)
-                (good_frames - 1)
-                * 100000LL)
-                /
-                elapsed_ms
-            );
-    }
-
-
-    long long avg_interval_ms = 0;
-
-    if (good_frames > 1)
-    {
-        avg_interval_ms =
-            total_interval_ms
-            /
-            (good_frames - 1);
-    }
-
-
-    printf("\r\n");
-    printf("========================================\r\n");
-    printf("Sensor -> ESP32 -> STM32 測試結果\r\n");
-    printf("========================================\r\n");
-
-    printf(
-        "有效封包       : %d\r\n",
-        good_frames
-    );
-
-    printf(
-        "Checksum Error : %d\r\n",
-        bad_checksum
-    );
-
-    printf(
-        "總接收時間     : %lld.%03lld s\r\n",
-        elapsed_ms / 1000,
-        elapsed_ms % 1000
-    );
-
-
-    printf(
-        "實際接收頻率   : %d.%02d Hz\r\n",
-        hz_x100 / 100,
-        hz_x100 % 100
-    );
-
-
-    printf(
-        "平均封包間隔   : %lld ms\r\n",
-        avg_interval_ms
-    );
-
-
-    printf(
-        "最大封包間隔   : %lld ms\r\n",
-        max_interval_ms
-    );
-
-
-    printf("========================================\r\n");
-}
-
-
-// ========================================================
-// 印 pressure
-// ========================================================
-void output_frame_csv(uint8_t *data)
-{
-    long long now_ms = get_elapsed_ms();
-
-    printf("DATA,%lld", now_ms);
-
-    for (int i = 0; i < 18; i++)
-    {
-        int index = 2 + i * 2;
-    
-        uint16_t pressure =
-            ((uint16_t)data[index] << 8)
-            | data[index + 1];
-    
-        printf(",%u", pressure);
-    }
-
-    printf("\r\n");
-}
-
-// ============================================================
-// 18 個感測區域幾何中心
-// AutoCAD 世界座標，單位 mm
-// ============================================================
-
-const float sensor_x[18] = {
-    1943.9325f,  // 1
-    1940.0133f,  // 2
-    1973.6715f,  // 3
-    1972.9752f,  // 4
-    1965.7372f,  // 5
-    1957.7049f,  // 6
-    1963.0637f,  // 7
-    1955.6792f,  // 8
-    1995.8721f,  // 9
-    1996.5690f,  // 10
-    1983.1920f,  // 11
-    1980.9491f,  // 12
-    1982.3130f,  // 13
-    1970.9490f,  // 14
-    2000.9966f,  // 15
-    2003.7015f,  // 16
-    2001.4963f,  // 17
-    1988.7695f   // 18
-};
-
-
-const float sensor_y[18] = {
-    2600.1604f,  // 1
-    2637.9524f,  // 2
-    2444.2083f,  // 3
-    2482.2769f,  // 4
-    2521.7471f,  // 5
-    2561.9473f,  // 6
-    2599.0265f,  // 7
-    2642.2744f,  // 8
-    2444.2212f,  // 9
-    2482.2769f,  // 10
-    2520.6611f,  // 11
-    2559.8462f,  // 12
-    2599.0265f,  // 13
-    2641.6030f,  // 14
-    2521.0309f,  // 15
-    2560.0963f,  // 16
-    2597.5737f,  // 17
-    2633.6218f   // 18
-};
-
-
-// ============================================================
-// COP 座標原點
-//
-// 之後決定好腳跟原點後，只要改這裡
-// ============================================================
-
-float origin_x = 0.0f;
-float origin_y = 0.0f;
-
-
-// ============================================================
-// 雜訊 threshold
-//
-// 先暫定 50 g
-// 之後用空載實驗決定
-// ============================================================
-
-const float FORCE_THRESHOLD = 50.0f;
-
-
-// ============================================================
-// COP 計算結果
-// ============================================================
-
-struct COPResult
-{
-    bool valid;
-
-    float x;
-    float y;
-
-    float total_force;
-};
-
-
 // ============================================================
 // 計算 COP
+// foot_id: 0x01 LEFT / 0x02 RIGHT
 // ============================================================
-
 COPResult calculate_cop(
-    const uint16_t pressure[18]
+    const uint16_t pressure[PRESSURE_COUNT],
+    uint8_t foot_id
 )
 {
     COPResult result;
-
     result.valid = false;
     result.x = 0.0f;
     result.y = 0.0f;
     result.total_force = 0.0f;
 
-
     float sum_F = 0.0f;
     float sum_Fx = 0.0f;
     float sum_Fy = 0.0f;
 
-
-    for (int i = 0; i < 18; i++)
+    for (int i = 0; i < PRESSURE_COUNT; i++)
     {
-        float F =
-            (float)pressure[i];
+        float F = (float)pressure[i];
 
+        float x = sensor_x[i] - origin_x;
+        float y = sensor_y[i] - origin_y;
 
-        // ----------------------------------------------------
-        // 將 AutoCAD 世界座標
-        // 轉成以 origin 為原點的座標
-        // ----------------------------------------------------
-
-        float x =
-            sensor_x[i]
-            - origin_x;
-
-        float y =
-            sensor_y[i]
-            - origin_y;
-
+        if (MIRROR_LEFT_X && foot_id == 0x01)
+        {
+            x = -x;
+        }
 
         sum_F += F;
-
-        sum_Fx +=
-            F * x;
-
-        sum_Fy +=
-            F * y;
+        sum_Fx += F * x;
+        sum_Fy += F * y;
     }
 
-
-    result.total_force =
-        sum_F;
-
-
-    // --------------------------------------------------------
-    // 總力過小：
-    // 視為沒有有效踩踏
-    // --------------------------------------------------------
+    result.total_force = sum_F;
 
     if (sum_F < FORCE_THRESHOLD)
     {
         return result;
     }
 
-
-    // --------------------------------------------------------
-    // COP
-    // --------------------------------------------------------
-
-    result.x =
-        sum_Fx / sum_F;
-
-    result.y =
-        sum_Fy / sum_F;
-
-    result.valid =
-        true;
-
+    result.x = sum_Fx / sum_F;
+    result.y = sum_Fy / sum_F;
+    result.valid = true;
 
     return result;
 }
 
-
 // ============================================================
-// 將 x100 整數格式化成小數點後兩位
-// 避免 Mbed printf 不支援 %f
+// 避免 Mbed printf 的 %f 問題
 // ============================================================
 void print_x100(int value_x100)
 {
@@ -439,7 +182,6 @@ void print_x100(int value_x100)
         decimal_part = -decimal_part;
     }
 
-    // 處理 -0.xx 的情況
     if (value_x100 < 0 && integer_part == 0)
     {
         printf("-");
@@ -449,209 +191,176 @@ void print_x100(int value_x100)
 }
 
 // ============================================================
-// 收到完整39 bytes
+// 更新某一隻腳的最新資料
 // ============================================================
-
-void process_frame()
+void update_foot_data(
+    FootData &foot,
+    const uint16_t pressures[PRESSURE_COUNT],
+    const COPResult &cop,
+    long long now_ms
+)
 {
-    // ========================================================
-    // checksum
-    // ========================================================
-
-    if (!check_checksum(frame))
+    for (int i = 0; i < PRESSURE_COUNT; i++)
     {
-        bad_checksum++;
-
-        printf(
-            "BAD CHECKSUM #%d\r\n",
-            bad_checksum
-        );
-
-        return;
+        foot.pressure[i] = pressures[i];
     }
 
-
-    // ========================================================
-    // 第一個有效 frame
-    // ========================================================
-
-    if (!testing)
+    if (foot.frame_count > 0)
     {
-        timer.reset();
-        timer.start();
+        long long interval_ms = now_ms - foot.last_timestamp_ms;
+        foot.total_interval_ms += interval_ms;
 
-        testing = true;
-
-        last_frame_time_ms = 0;
-
-        printf("\r\n");
-        printf("收到第一個完整 frame，開始計時\r\n");
-    }
-
-
-    // ========================================================
-    // 時間統計
-    // ========================================================
-
-    long long now_ms =
-        get_elapsed_ms();
-
-
-    if (good_frames > 0)
-    {
-        long long interval_ms =
-            now_ms -
-            last_frame_time_ms;
-
-
-        total_interval_ms +=
-            interval_ms;
-
-
-        if (
-            interval_ms >
-            max_interval_ms
-        )
+        if (interval_ms > foot.max_interval_ms)
         {
-            max_interval_ms =
-                interval_ms;
+            foot.max_interval_ms = interval_ms;
         }
     }
 
+    foot.timestamp_ms = now_ms;
+    foot.last_timestamp_ms = now_ms;
+    foot.frame_count++;
 
-    last_frame_time_ms =
-        now_ms;
+    foot.cop_valid = cop.valid;
+    foot.cop_x = cop.x;
+    foot.cop_y = cop.y;
+    foot.total_force = cop.total_force;
+}
 
+// ============================================================
+// 輸出一筆 CSV
+// 格式：
+// DATA,L/R,time_ms,P1...P18,Total_g,COP_valid,COP_X_mm,COP_Y_mm
+// ============================================================
+void output_frame_csv(
+    uint8_t foot_id,
+    long long now_ms,
+    const uint16_t pressures[PRESSURE_COUNT],
+    const COPResult &cop
+)
+{
+    char foot_char = (foot_id == 0x01) ? 'L' : 'R';
 
-    good_frames++;
+    printf("DATA,%c,%lld", foot_char, now_ms);
 
-
-    // 每收到一個有效 frame，就輸出 CSV
-    output_frame_csv(frame);
-
-        // ========================================================
-    // 解析18點壓力
-    // ========================================================
-    
-    uint16_t pressures[18];
-    
-    for (int i = 0; i < 18; i++)
+    for (int i = 0; i < PRESSURE_COUNT; i++)
     {
-        int index =
-            2 + i * 2;
-    
-        pressures[i] =
-            ((uint16_t)frame[index] << 8)
-            |
-            frame[index + 1];
+        printf(",%u", pressures[i]);
     }
-    
-    
-    // ========================================================
-    // 算 COP
-    // ========================================================
-    
-    COPResult cop =
-        calculate_cop(
-            pressures
-        );
-    
-    
-    // ========================================================
-    // 輸出
-    // ========================================================
-    
+
+    printf(",%d,%d,", (int)cop.total_force, cop.valid ? 1 : 0);
+
     if (cop.valid)
     {
-        int cop_x_x100 = (int)(cop.x * 100.0f);
-        int cop_y_x100 = (int)(cop.y * 100.0f);
-
-        printf("COP_X=");
-        print_x100(cop_x_x100);
-
-        printf(" mm, COP_Y=");
-        print_x100(cop_y_x100);
-
-        printf(
-            " mm, Total=%d g\r\n",
-            (int)cop.total_force
-        );
+        print_x100((int)(cop.x * 100.0f));
+        printf(",");
+        print_x100((int)(cop.y * 100.0f));
     }
     else
     {
-        printf(
-            "No load | Total=%d g\r\n",
-            (int)cop.total_force
-        );
+        // COP 無效時留空，避免把 (0,0) 誤認成真正 COP
+        printf(",");
     }
-    // ========================================================
-    // 500包完成
-    // ========================================================
 
-    if (
-        good_frames >=
-        TOTAL_PACKETS
-    )
-    {
-        print_result();
-
-
-        // 停在這裡
-        while (true)
-        {
-            ThisThread::sleep_for(
-                1s
-            );
-        }
-    }
+    printf("\r\n");
 }
 
+// ============================================================
+// 收到完整 39 bytes 後處理
+// ============================================================
+void process_frame()
+{
+    if (!check_checksum(frame))
+    {
+        bad_checksum++;
+        printf("BAD CHECKSUM #%lu\r\n", bad_checksum);
+        return;
+    }
+
+    uint8_t foot_id = frame[1];
+
+    if (foot_id != 0x01 && foot_id != 0x02)
+    {
+        return;
+    }
+
+    if (!timer_started)
+    {
+        timer.reset();
+        timer.start();
+        timer_started = true;
+
+        printf("\r\n收到第一個完整 frame，開始計時\r\n");
+    }
+
+    long long now_ms = get_elapsed_ms();
+
+    uint16_t pressures[PRESSURE_COUNT];
+
+    for (int i = 0; i < PRESSURE_COUNT; i++)
+    {
+        int index = 2 + i * 2;
+
+        pressures[i] =
+            ((uint16_t)frame[index] << 8) |
+            frame[index + 1];
+    }
+
+    COPResult cop = calculate_cop(pressures, foot_id);
+
+    if (foot_id == 0x01)
+    {
+        update_foot_data(left_foot, pressures, cop, now_ms);
+    }
+    else
+    {
+        update_foot_data(right_foot, pressures, cop, now_ms);
+    }
+
+    total_good_frames++;
+
+    // 每一包都輸出，之後可直接改成寫 microSD
+    output_frame_csv(foot_id, now_ms, pressures, cop);
+
+    // 每 100 包只印一次簡短統計，避免額外 printf 太多
+    if (total_good_frames % 100 == 0)
+    {
+        printf(
+            "STATUS,Total=%lu,Left=%lu,Right=%lu,BadChecksum=%lu\r\n",
+            total_good_frames,
+            left_foot.frame_count,
+            right_foot.frame_count,
+            bad_checksum
+        );
+    }
+}
 
 // ============================================================
 // 一個 byte 一個 byte餵進 parser
 // ============================================================
-
 void parse_byte(uint8_t b)
 {
-    // ========================================================
-    // 等待 AA
-    // ========================================================
-
+    // 等待 frame 起始 0xAA
     if (frame_index == 0)
     {
         if (b == 0xAA)
         {
             frame[0] = b;
-
             frame_index = 1;
         }
-
         return;
     }
 
-
-    // ========================================================
-    // 第二 byte 必須 01 或 02
-    // ========================================================
-
+    // 第二 byte 必須為 LEFT(01) 或 RIGHT(02)
     if (frame_index == 1)
     {
-        if (
-            b == 0x01 ||
-            b == 0x02
-        )
+        if (b == 0x01 || b == 0x02)
         {
             frame[1] = b;
-
             frame_index = 2;
         }
         else if (b == 0xAA)
         {
-            // 又遇到新的 AA
-            // 保留作為下一個 frame 開頭
-
             frame[0] = 0xAA;
-
             frame_index = 1;
         }
         else
@@ -662,87 +371,44 @@ void parse_byte(uint8_t b)
         return;
     }
 
-
-    // ========================================================
-    // 收剩下的 bytes
-    // ========================================================
-
     frame[frame_index] = b;
-
     frame_index++;
-
-
-    // ========================================================
-    // 收滿39 bytes
-    // ========================================================
 
     if (frame_index == FRAME_SIZE)
     {
         process_frame();
-
         frame_index = 0;
     }
 }
 
-
 // ============================================================
 // main
 // ============================================================
-
 int main()
 {
     esp32.set_blocking(false);
 
-
     printf("\r\n");
     printf("========================================\r\n");
-    printf("Sensor -> ESP32 -> STM32\r\n");
+    printf("Dual Foot Sensor -> ESP32 -> STM32\r\n");
     printf("39-byte Pressure Sensor Receiver\r\n");
     printf("========================================\r\n");
-
-    printf(
-        "UART: PA10 RX, 115200 baud\r\n"
-    );
-
-    printf(
-        "等待 ESP32 傳送感測器資料...\r\n"
-    );
-
-
-    // ========================================================
-    // 暫存 UART 一次讀到的資料
-    //
-    // 注意：
-    // ESP32 雖然 write(frame, 39)
-    // STM32 read() 不保證一次就是39 bytes
-    // 所以一次最多讀64，再逐byte解析
-    // ========================================================
+    printf("UART: PA10 RX, 115200 baud\r\n");
+    printf("等待 LEFT / RIGHT 感測器資料...\r\n");
 
     uint8_t rx_buffer[64];
-
 
     while (true)
     {
         if (esp32.readable())
         {
-            ssize_t count =
-                esp32.read(
-                    rx_buffer,
-                    sizeof(rx_buffer)
-                );
-
+            ssize_t count = esp32.read(rx_buffer, sizeof(rx_buffer));
 
             if (count > 0)
             {
-                for (
-                    ssize_t i = 0;
-                    i < count;
-                    i++
-                )
+                for (ssize_t i = 0; i < count; i++)
                 {
-                    parse_byte(
-                        rx_buffer[i]
-                    );
+                    parse_byte(rx_buffer[i]);
                 }
             }
         }
