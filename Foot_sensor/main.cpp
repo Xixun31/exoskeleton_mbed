@@ -56,8 +56,8 @@ const float sensor_y[PRESSURE_COUNT] = {
 };
 
 // 之後決定腳跟原點後改這裡
-float origin_x = 0.0f;
-float origin_y = 0.0f;
+float origin_x = 1984.7721f;
+float origin_y = 2415.3761f;
 
 // 如果上面這組座標是「右腳」CAD，而你希望左腳用相同身體座標系鏡射，
 // 把這個改成 true。若左右腳各自使用自己的局部座標系，保持 false。
