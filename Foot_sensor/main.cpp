@@ -1,5 +1,10 @@
 #include "mbed.h"
 #include <chrono>
+#include "SDBlockDevice.h"
+#include "FATFileSystem.h"
+#include <cstdio>
+#include <sys/stat.h>
+#include <cerrno>
 
 // ============================================================
 // UART
@@ -9,6 +14,162 @@
 // ============================================================
 BufferedSerial esp32(PA_9, PA_10, 115200);
 BufferedSerial pc(USBTX, USBRX, 115200);
+
+// ============================================================
+// microSD (SPI)
+// NUCLEO-F446RE Arduino SPI pins:
+// MOSI=PA7(D11), MISO=PA6(D12), SCK=PA5(D13), CS=PB6(D10)
+// ============================================================
+SDBlockDevice sd(PA_7, PA_6, PA_5, PB_6);
+FATFileSystem fs("fs");
+
+FILE *log_file = nullptr;
+bool sd_ready = false;
+char log_path[64] = {};
+static char sd_stdio_buffer[4096];
+
+// ============================================================
+// USER Button B1：安全停止 microSD 紀錄
+// NUCLEO-F446RE 的 B1 接在 PC13，按下時為 Low
+// ============================================================
+DigitalIn user_button(BUTTON1);
+bool recording_active = true;
+
+
+
+// ============================================================
+// SD 初始化與建立新檔
+// 每次開機自動找第一個不存在的 runXXX.csv
+// 不會覆蓋 SD 卡原本檔案
+// ============================================================
+bool init_sd_logger()
+{
+    printf("初始化 microSD...\r\n");
+
+    int err = sd.init();
+    if (err != 0)
+    {
+        printf("SD init failed: %d\r\n", err);
+        return false;
+    }
+
+    err = fs.mount(&sd);
+    if (err != 0)
+    {
+        printf("SD mount failed: %d\r\n", err);
+        printf("請確認 SD 卡為 FAT32（不要在程式中自動 format，以免刪除原資料）\r\n");
+        sd.deinit();
+        return false;
+    }
+
+    // 建立專屬資料夾；若已存在，mkdir 失敗可忽略
+    mkdir("/fs/exoskeleton_project_record/foot_sensor", 0777);
+
+    // 自動建立 run001.csv、run002.csv ...
+    struct stat st;
+    bool found_name = false;
+
+    for (int i = 1; i <= 999; i++)
+    {
+        snprintf(log_path, sizeof(log_path), "/fs/exoskeleton_project_record/foot_sensor/run%03d.csv", i);
+
+        if (stat(log_path, &st) != 0)
+        {
+            found_name = true;
+            break;
+        }
+    }
+
+    if (!found_name)
+    {
+        printf("找不到可用檔名 run001~run999.csv\r\n");
+        fs.unmount();
+        sd.deinit();
+        return false;
+    }
+
+    log_file = fopen(log_path, "w");
+    if (log_file == nullptr)
+    {
+        printf("無法建立 CSV: %s\r\n", log_path);
+        fs.unmount();
+        sd.deinit();
+        return false;
+    }
+
+    // 讓 fprintf 先進 RAM buffer，降低每一筆都直接寫 SD 的負擔
+    setvbuf(log_file, sd_stdio_buffer, _IOFBF, sizeof(sd_stdio_buffer));
+
+    fprintf(
+        log_file,
+        "time_ms,foot,P1,P2,P3,P4,P5,P6,P7,P8,P9,P10,P11,P12,P13,P14,P15,P16,P17,P18,total_g,COP_valid,COP_X_mm,COP_Y_mm\r\n"
+    );
+    fflush(log_file);
+
+    printf("SD ready\r\n");
+    printf("CSV: %s\r\n", log_path);
+
+    return true;
+}
+
+// ============================================================
+// 安全停止 SD 紀錄
+// 1. fflush：把尚在 RAM stdio buffer 的資料送到檔案系統
+// 2. fclose：再做一次 flush 並關閉檔案
+// 3. unmount/deinit：讓 SD 卡回到可安全拔除的狀態
+// ============================================================
+void stop_sd_logger()
+{
+    if (!recording_active)
+    {
+        return;
+    }
+
+    recording_active = false;
+
+    printf("\r\n========================================\r\n");
+    printf("B1 pressed -> stopping SD recording...\r\n");
+
+    if (log_file != nullptr)
+    {
+        fflush(log_file);
+        fclose(log_file);
+        log_file = nullptr;
+        printf("CSV flushed and closed\r\n");
+    }
+
+    if (sd_ready)
+    {
+        fs.unmount();
+        sd.deinit();
+        sd_ready = false;
+        printf("microSD unmounted safely\r\n");
+    }
+
+    printf("Recording stopped safely.\r\n");
+    printf("現在可以拔 SD 卡或關閉電源。\r\n");
+    printf("STM32 仍會繼續接收/顯示資料，但不再寫入 SD。\r\n");
+    printf("========================================\r\n");
+}
+
+// 將 x100 整數寫成 xx.xx 到檔案，避免依賴 %%f
+void fprint_x100(FILE *file, int value_x100)
+{
+    int integer_part = value_x100 / 100;
+    int decimal_part = value_x100 % 100;
+
+    if (decimal_part < 0)
+    {
+        decimal_part = -decimal_part;
+    }
+
+    if (value_x100 < 0 && integer_part == 0)
+    {
+        fprintf(file, "-");
+    }
+
+    fprintf(file, "%d.%02d", integer_part, decimal_part);
+}
 
 // ============================================================
 // 感測器封包
@@ -265,6 +426,54 @@ void output_frame_csv(
 }
 
 // ============================================================
+// 將同一筆資料存入 microSD CSV
+// ============================================================
+void save_frame_csv(
+    uint8_t foot_id,
+    long long now_ms,
+    const uint16_t pressures[PRESSURE_COUNT],
+    const COPResult &cop
+)
+{
+    if (!recording_active || !sd_ready || log_file == nullptr)
+    {
+        return;
+    }
+
+    char foot_char = (foot_id == 0x01) ? 'L' : 'R';
+
+    fprintf(log_file, "%lld,%c", now_ms, foot_char);
+
+    for (int i = 0; i < PRESSURE_COUNT; i++)
+    {
+        fprintf(log_file, ",%u", pressures[i]);
+    }
+
+    fprintf(log_file, ",%d,%d,", (int)cop.total_force, cop.valid ? 1 : 0);
+
+    if (cop.valid)
+    {
+        fprint_x100(log_file, (int)(cop.x * 100.0f));
+        fprintf(log_file, ",");
+        fprint_x100(log_file, (int)(cop.y * 100.0f));
+    }
+    else
+    {
+        // COP 無效：X、Y 都留空
+        fprintf(log_file, ",");
+    }
+
+    fprintf(log_file, "\r\n");
+
+    // 左右腳合計每 100 個有效 frame 寫回 SD 一次
+    // 約每 2~3 秒 flush 一次；斷電時最多可能遺失最後這一小段 buffer
+    if (total_good_frames % 100 == 0)
+    {
+        fflush(log_file);
+    }
+}
+
+// ============================================================
 // 收到完整 39 bytes 後處理
 // ============================================================
 void process_frame()
@@ -320,6 +529,7 @@ void process_frame()
 
     // 每一包都輸出，之後可直接改成寫 microSD
     output_frame_csv(foot_id, now_ms, pressures, cop);
+    save_frame_csv(foot_id, now_ms, pressures, cop);
 
     // 每 100 包只印一次簡短統計，避免額外 printf 太多
     if (total_good_frames % 100 == 0)
@@ -387,6 +597,7 @@ void parse_byte(uint8_t b)
 int main()
 {
     esp32.set_blocking(false);
+    user_button.mode(PullUp);
 
     printf("\r\n");
     printf("========================================\r\n");
@@ -394,12 +605,42 @@ int main()
     printf("39-byte Pressure Sensor Receiver\r\n");
     printf("========================================\r\n");
     printf("UART: PA10 RX, 115200 baud\r\n");
+
+    sd_ready = init_sd_logger();
+
+    if (sd_ready)
+    {
+        printf("microSD logging ENABLED\r\n");
+    }
+    else
+    {
+        printf("microSD logging DISABLED，仍會繼續接收並輸出到 Serial\r\n");
+    }
+
     printf("等待 LEFT / RIGHT 感測器資料...\r\n");
+    printf("按下藍色 B1 USER 按鈕可安全停止 SD 紀錄。\r\n");
 
     uint8_t rx_buffer[64];
 
     while (true)
     {
+        // B1 按下為 Low；做 50 ms debounce 確認
+        if (recording_active && user_button.read() == 0)
+        {
+            ThisThread::sleep_for(50ms);
+
+            if (user_button.read() == 0)
+            {
+                stop_sd_logger();
+
+                // 等使用者放開按鈕，避免重複觸發
+                while (user_button.read() == 0)
+                {
+                    ThisThread::sleep_for(10ms);
+                }
+            }
+        }
+
         if (esp32.readable())
         {
             ssize_t count = esp32.read(rx_buffer, sizeof(rx_buffer));
