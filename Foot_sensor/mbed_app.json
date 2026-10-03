@@ -1,0 +1,11 @@
+{
+    "target_overrides": {
+        "NUCLEO_F446RE": {
+            "platform.stdio-baud-rate": 115200,
+            "platform.stdio-convert-newlines": true,
+            "target.printf_lib": "std",
+            "target.features_add": ["STORAGE"],
+            "target.components_add": ["SD"]
+        }
+    }
+}
