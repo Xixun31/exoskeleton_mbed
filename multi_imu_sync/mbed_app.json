@@ -1,0 +1,11 @@
+{
+    "target_overrides": {
+        "NUCLEO_F446RE": {
+            "platform.stdio-baud-rate": 921600,
+            "platform.stdio-convert-newlines": true,
+            "platform.stdio-buffered-serial": true,
+            "drivers.uart-serial-txbuf-size": 2048,
+            "target.printf_lib": "std"
+        }
+    }
+}
