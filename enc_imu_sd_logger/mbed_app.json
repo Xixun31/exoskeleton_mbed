@@ -1,0 +1,15 @@
+{
+    "target_overrides": {
+        "NUCLEO_F446RE": {
+            "platform.stdio-baud-rate": 115200,
+            "platform.stdio-convert-newlines": true,
+            "platform.stdio-buffered-serial": true,
+            "drivers.uart-serial-txbuf-size": 2048,
+            "target.printf_lib": "std",
+            "target.features_add": ["STORAGE"],
+            "target.components_add": ["SD"],
+            "sd.CMD_TIMEOUT": 1000,
+            "rtos.main-thread-stack-size": 8192
+        }
+    }
+}

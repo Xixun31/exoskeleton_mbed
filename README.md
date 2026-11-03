@@ -114,5 +114,7 @@ cp ./BUILD/NUCLEO_F446RE/GCC_ARM/*.bin /media/xixun/NOD_F446RE/ && sync
 - [imu_uart/](file:///home/xixun/project/mbed/imu_uart): 讀取單 UART IMU 數據專案。
 - [imu_dual_uart/](file:///home/xixun/project/mbed/imu_dual_uart): 讀取雙 UART IMU 數據專案（中斷回呼設計）。
 - [imu_spi/](file:///home/xixun/project/mbed/imu_spi) / [imu2spi/](file:///home/xixun/project/mbed/imu2spi): 讀取單 SPI IMU 數據專案。
+- [enc_imu_sd_logger/](file:///home/xixun/project/mbed/enc_imu_sd_logger): 2 顆串接 AS5145 + 1 顆 SPI IMU，100Hz 同步讀取並存到 microSD（三組 SPI），可接電源獨立紀錄。接線與操作見 [操作手冊](file:///home/xixun/project/mbed/enc_imu_sd_logger/README.md)。
+- [encoder_chain_test/](file:///home/xixun/project/mbed/encoder_chain_test): AS5145 串接 (daisy chain) 測試與除錯工具（原始位元、靜止統計、MISO 上拉、CS 固定供電表量測）。
 - [mbed-os5-passive/](file:///home/xixun/project/mbed/mbed-os5-passive): 被動模式下的 Mbed OS 5。
 - [Test_NUCLEO_F446RE/](file:///home/xixun/project/mbed/Test_NUCLEO_F446RE): 基礎硬體測試專案。
