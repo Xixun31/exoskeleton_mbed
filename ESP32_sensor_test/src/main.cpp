@@ -24,7 +24,12 @@ HardwareSerial SensorUART(2);
 
 const int UART_RX_PIN = 16;   // 這次不使用
 const int UART_TX_PIN = 17;
-const int UART_BAUD = 115200;
+const int UART_BAUD = 115200;   // 要跟 STM32 程式的 FOOT_BAUD 一樣
+
+// true：送 47-byte 封包 (0xAB + 原始 39 bytes + ESP32 時間戳 + 封包編號 + checksum)，
+//       STM32 (enc_imu_sd_logger) 用來檢查時間對齊；舊的 Foot_sensor 程式也讀得到 (會忽略多出來的 bytes)
+// false：只送原始 39 bytes
+const bool SEND_TIMESTAMP = true;
 
 // ============================================================
 // BLE 裝置與 Client
@@ -77,7 +82,8 @@ void processFrame(
     uint8_t* frame,
     int sensorNo,
     unsigned long& goodFrames,
-    unsigned long& badFrames)
+    unsigned long& badFrames,
+    uint32_t rxMicros)
 {
     if (!checkFrame(frame))
     {
@@ -89,7 +95,28 @@ void processFrame(
     goodFrames++;
 
     // 原封不動送給 STM32，由 STM32 依 frame[1] 判斷 LEFT / RIGHT
-    SensorUART.write(frame, 39);
+    if (SEND_TIMESTAMP)
+    {
+        // [0]=0xAB, [1..39]=原始 frame, [40..43]=收到 BLE notify 的 micros() (little-endian),
+        // [44..45]=這顆感測器的封包編號 (低 16 bit), [46]=前 46 bytes 加總低 8 位
+        uint8_t pkt[47];
+        pkt[0] = 0xAB;
+        memcpy(&pkt[1], frame, 39);
+        pkt[40] = rxMicros & 0xFF;
+        pkt[41] = (rxMicros >> 8) & 0xFF;
+        pkt[42] = (rxMicros >> 16) & 0xFF;
+        pkt[43] = (rxMicros >> 24) & 0xFF;
+        pkt[44] = goodFrames & 0xFF;
+        pkt[45] = (goodFrames >> 8) & 0xFF;
+        uint8_t sum = 0;
+        for (int i = 0; i < 46; i++) sum += pkt[i];
+        pkt[46] = sum;
+        SensorUART.write(pkt, sizeof(pkt));
+    }
+    else
+    {
+        SensorUART.write(frame, 39);
+    }
 
     // 為了避免大量 Serial.print 影響 BLE 接收，不每包印 39 bytes。
     // 每 100 包回報一次即可。
@@ -120,7 +147,8 @@ void feedNotifyBytes(
     size_t& frameIndex,
     int sensorNo,
     unsigned long& goodFrames,
-    unsigned long& badFrames)
+    unsigned long& badFrames,
+    uint32_t rxMicros)
 {
     for (size_t i = 0; i < length; i++)
     {
@@ -165,7 +193,8 @@ void feedNotifyBytes(
                 frameBuffer,
                 sensorNo,
                 goodFrames,
-                badFrames
+                badFrames,
+                rxMicros
             );
 
             frameIndex = 0;
@@ -182,6 +211,7 @@ void notifyCallback1(
     size_t length,
     bool isNotify)
 {
+    uint32_t t = micros();  // 收到 BLE notify 的時間 (ESP32 時鐘)
     feedNotifyBytes(
         data,
         length,
@@ -189,7 +219,8 @@ void notifyCallback1(
         frameIndex1,
         1,
         goodFrames1,
-        badFrames1
+        badFrames1,
+        t
     );
 }
 
@@ -202,6 +233,7 @@ void notifyCallback2(
     size_t length,
     bool isNotify)
 {
+    uint32_t t = micros();  // 收到 BLE notify 的時間 (ESP32 時鐘)
     feedNotifyBytes(
         data,
         length,
@@ -209,7 +241,8 @@ void notifyCallback2(
         frameIndex2,
         2,
         goodFrames2,
-        badFrames2
+        badFrames2,
+        t
     );
 }
 
