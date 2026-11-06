@@ -34,7 +34,7 @@
 //   ESP32 GPIO17 (TX) → PA_10 (RX) CN10-33     ESP32 GND → GND (CN10-9 / CN7-19 等，一定要共地)
 //   PA_9 (TX) CN10-21 保留不接
 //  [UART IMU A, USART3 921600]  IMU TX → PC_5 (RX) CN10-6    IMU RX ← PB_10 (TX) CN10-25
-//  [UART IMU B, UART4  115200]  IMU TX → PA_1 (RX) CN7-30    IMU RX ← PA_0  (TX) CN7-28
+//  [UART IMU B, UART4  921600]  IMU TX → PA_1 (RX) CN7-30    IMU RX ← PA_0  (TX) CN7-28
 //   兩顆 IMU 的 GND 都要接板子 GND；鮑率要跟 IMU 設定一樣 (UIMU_BAUD)，不知道可用 imu_uart_dual_100hz 的 's' 掃描
 //  電源：3V3 CN7-16、5V CN7-18、GND CN7-8 / CN7-19 / CN7-20 / CN10-9 / CN10-20
 //
@@ -128,7 +128,7 @@ UnbufferedSerial foot_uart(PA_9, PA_10, FOOT_BAUD);  // tx (不接), rx
 
 // UART IMU：A = USART3 (PB_10 TX, PC_5 RX)、B = UART4 (PA_0 TX, PA_1 RX)。鮑率要跟各 IMU 的設定一樣
 const int N_UIMU = 2;
-const int UIMU_BAUD[N_UIMU] = {921600, 115200};
+const int UIMU_BAUD[N_UIMU] = {921600, 921600};
 
 // 「準備好」(LD2 恆亮) 需要哪些裝置正常；今天沒接的裝置改 false
 const bool REQ_ENC = true, REQ_SPI_IMU = true, REQ_UART_IMU = true, REQ_FOOT = true;

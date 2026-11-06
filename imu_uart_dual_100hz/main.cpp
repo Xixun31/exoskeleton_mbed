@@ -29,8 +29,8 @@
 #include <cmath>
 
 // ---------------- 設定 ----------------
-// 要跟各 IMU 設定的一樣 (用 's' 掃描可以查)。目前一包約 69 byte，115200 在 100Hz 時約 60% 負載
-const int IMU_BAUD[2] = {921600, 115200};  // IMU_A, IMU_B
+// 要跟各 IMU 設定的一樣 (用 's' 掃描可以查)。兩顆都用 921600 (一包約 69 byte，傳輸約 0.75 ms)
+const int IMU_BAUD[2] = {921600, 921600};  // IMU_A, IMU_B
 const int LOOP_HZ = 100;
 const float RAD2DEG = 57.2957795f;
 

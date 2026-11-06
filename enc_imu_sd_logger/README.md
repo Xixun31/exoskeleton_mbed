@@ -67,11 +67,11 @@
 | IMU | 介面 | 鮑率 | IMU TX → MCU RX | IMU RX ← MCU TX |
 |---|---|---|---|---|
 | A | USART3 | 921600 | PC_5 CN10-6 | PB_10 CN10-25 |
-| B | UART4 | 115200 | PA_1 CN7-30 | PA_0 CN7-28 |
+| B | UART4 | 921600 | PA_1 CN7-30 | PA_0 CN7-28 |
 
 - **TX / RX 要交叉接** (IMU 的 TX 接 MCU 的 RX)。接反時完全收不到資料。
 - IMU 的 GND 要接板子 GND；IMU 的 UART 必須是 3.3V TTL。
-- 鮑率要跟 IMU 設定一樣 (`main.cpp` 的 `UIMU_BAUD`)。不知道 IMU 的鮑率時，燒 `imu_uart_dual_100hz/` 用 `s` 指令掃描。
+- 鮑率要跟 IMU 設定一樣 (`main.cpp` 的 `UIMU_BAUD`，兩顆都是 921600；IMU 端用 MT Manager 設定)。不知道 IMU 的鮑率時，燒 `imu_uart_dual_100hz/` 用 `s` 指令掃描。
 - IMU 輸出要開 Euler、Acceleration、Rate of Turn (建議再加 PacketCounter、SampleTimeFine)，用 MT Manager 設定。
 - 2026-11-06 用 `imu_uart_dual_100hz/` 測試 10 秒：兩顆都 100 包/秒、checksum 錯誤 0、掉包 0。
 
