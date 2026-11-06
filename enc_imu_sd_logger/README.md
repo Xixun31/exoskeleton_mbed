@@ -1,6 +1,6 @@
 # enc_imu_sd_logger 操作手冊
 
-2 顆 AS5145 編碼器 (串接) + 1 顆 Xsens MTi IMU，以 100 Hz 同步讀取；再加上左右腳足底感測器 (BLE → ESP32 → UART)。
+2 顆 AS5145 編碼器 (串接) + 1 顆 SPI IMU + 2 顆 UART IMU (Xsens MTi)，以 100 Hz 同步讀取；再加上左右腳足底感測器 (BLE → ESP32 → UART)。
 全部用同一個 MCU µs 時鐘打時間戳 (time code)，存到 microSD 卡，可以檢查各裝置時間有沒有對齊。
 不接電腦、只接電源就能獨立紀錄；用板子上的藍色 B1 按鈕操作，綠燈 LD2 看狀態。
 
@@ -63,6 +63,18 @@
 - ESP32 用自己的 USB 線供電 (例如同一顆行動電源的第二個 USB 孔)；**不要從 NUCLEO 的 3.3V 供電** (BLE 電流尖峰會讓 3.3V 掉壓)。
 - 舊的 `Foot_sensor` 程式把 SD 卡接在 PA5~PA7、PB6 (Arduino SPI)；這個程式的 SD 卡改在 SPI3 (CN7-1~4)，**不要照舊接法接 SD**。
 
+### UART IMU ×2 (USART3 / UART4)
+| IMU | 介面 | 鮑率 | IMU TX → MCU RX | IMU RX ← MCU TX |
+|---|---|---|---|---|
+| A | USART3 | 921600 | PC_5 CN10-6 | PB_10 CN10-25 |
+| B | UART4 | 115200 | PA_1 CN7-30 | PA_0 CN7-28 |
+
+- **TX / RX 要交叉接** (IMU 的 TX 接 MCU 的 RX)。接反時完全收不到資料。
+- IMU 的 GND 要接板子 GND；IMU 的 UART 必須是 3.3V TTL。
+- 鮑率要跟 IMU 設定一樣 (`main.cpp` 的 `UIMU_BAUD`)。不知道 IMU 的鮑率時，燒 `imu_uart_dual_100hz/` 用 `s` 指令掃描。
+- IMU 輸出要開 Euler、Acceleration、Rate of Turn (建議再加 PacketCounter、SampleTimeFine)，用 MT Manager 設定。
+- 2026-11-06 用 `imu_uart_dual_100hz/` 測試 10 秒：兩顆都 100 包/秒、checksum 錯誤 0、掉包 0。
+
 ### 腳位總表
 | 裝置 | 介面 | 使用腳位 |
 |---|---|---|
@@ -70,6 +82,8 @@
 | IMU | SPI2 | PB_13、PB_14、PB_15、PB_1、(PC_8) |
 | microSD | SPI3 | PC_10、PC_11、PC_12、PD_2 |
 | 足底 ESP32 | USART1 | PA_10 (PA_9 保留) |
+| UART IMU A | USART3 | PC_5 (RX)、PB_10 (TX) |
+| UART IMU B | UART4 | PA_1 (RX)、PA_0 (TX) |
 | 板上 | | PA_2/PA_3 序列埠 (USB)、PA_5 LD2、PC_13 B1、PA_13/PA_14 SWD |
 
 ---
@@ -91,35 +105,34 @@
 
 ## 3. 操作
 
-### 開機 → 自動開始紀錄
-1. 插好 SD 卡，接上電源；ESP32 也接上電源 (足底感測器開機，ESP32 會自動掃描連線，約 5~15 秒)。
-2. 約 3~5 秒後 (等 IMU 開機)，**LD2 綠燈開始慢閃 (1 秒亮滅一次) = 紀錄中**。
-3. 每次開機會建立新檔，不會覆蓋舊檔。
-4. 足底資料只要 ESP32 一送過來就會寫進 `runXXX_foot.csv`；ESP32 比較晚連上也沒關係，用時間戳對齊即可。
+**完整步驟見 [FLOW.md](FLOW.md)**。摘要：
+
+開機 → 等所有裝置正常 (**LD2 恆亮 = 準備好**) → 按一下 B1 → **保持不動 3 秒記錄原點** (LD2 快閃，存 `runXXX_origin.csv`) → 自動開始測量 (LD2 慢閃) → 再按 B1 停止。
 
 ### 綠燈 LD2
 | 狀態 | 意思 |
 |---|---|
-| 慢閃 (約 1 Hz) | 紀錄中 |
-| 恆亮 | 已停止，可以安全拔卡 / 關電 |
-| 快閃 (約 5 Hz) | SD 卡錯誤 (沒插、沒格式化、接觸不良)。插好後短按 B1 重試 |
-| 不亮 | 開機中 (前 3 秒) |
+| 熄滅 | 沒準備好 (開機中、某個裝置沒資料、SD 卡沒插 / 出錯)，序列埠 `READY` 行會顯示哪一項 NG |
+| 恆亮 | 準備好，按 B1 開始；也代表沒在紀錄，可以拔卡 / 關電 |
+| 快閃 (約 5 Hz) | 原點 3 秒中，保持不動 |
+| 慢閃 (約 1 Hz) | 測量中 |
 
-### 藍色 B1 按鈕
-| 操作 | 功能 |
+### 藍色 B1 按鈕 (放開時動作)
+| 狀態 | 功能 |
 |---|---|
-| **短按** (紀錄中) | 停止紀錄、關檔、卸載 SD → 綠燈恆亮，可以拔卡 |
-| **短按** (已停止) | 開一個新檔繼續紀錄 |
-| **按住 3 秒** | 兩顆 encoder **歸零** (目前位置 = 0°)，按住時與放開後 1 秒請保持不動 |
+| 準備好 | 開新檔 → 原點 3 秒 → 測量 |
+| 沒準備好 | 不動作 (要強制開始用序列埠 `g`) |
+| 原點中 / 測量中 | 停止並關檔 |
 
 ### 關機 / 拔卡
-- **先短按 B1，等綠燈恆亮再拔卡或關電**。
+- **先按 B1 停止，等綠燈不再閃爍再拔卡或關電**。
 - 如果直接斷電：程式每秒會把資料寫回 SD 一次，最多遺失最後約 1 秒，檔案仍可讀。
   (此功能尚未在電腦上實際驗證，重要的實驗請一律先按 B1 再關電。)
 
 ### 歸零
 - 歸零值存在 MCU 內部 flash，**斷電、重開機、重新燒錄都會保留**，不用每次開機都做。
-- 只有要換新的零點時才需要：把關節擺到 0° 的位置，按住 B1 3 秒。
+- 只有要換新的零點時才需要：把關節擺到 0° 的位置，在序列埠送 `z` (只能在沒紀錄時)。
+  (以前的「按住 B1 3 秒」已拿掉，避免跟原點流程搞混。每次量測的原點另外存在 `runXXX_origin.csv`，不影響這個零點。)
 - 目前沒有燈號提示歸零完成；可在序列埠看到 `ZERO: enc1=… enc2=… saved=1`，或看 CSV 的 `encX_deg` 是否變成約 0。
 - 歸零時取樣會暫停約 0.4 秒 (寫 flash)，CSV 會少約 40 行 (`t_s` 會跳一段)，這段時間的足底封包也會遺失。
 
@@ -127,9 +140,12 @@
 
 ## 4. 資料檔
 
-每次紀錄產生兩個檔，放在 `/exoskeleton_project_record/enc_imu_foot/`：
-- `run001.csv`：encoder + IMU，每 10 ms 一行 (100 Hz)
+每次紀錄產生三個檔，放在 `/exoskeleton_project_record/enc_imu_foot/`：
+- `run001.csv`：encoder + SPI IMU + UART IMU A / B，每 10 ms 一行 (100 Hz)
 - `run001_foot.csv`：足底感測器，每收到一包 (左或右腳) 一行
+- `run001_origin.csv`：原點 3 秒每個通道的平均 / 範圍 / time code (格式見 [FLOW.md](FLOW.md))
+
+兩個資料檔都有 `phase` 欄位：1 = 原點 (前 3 秒)、2 = 測量。
 
 ### 每個裝置的 time code (都是 MCU 時鐘，單位秒，µs 解析度，可以直接相減)
 | 欄位 | 檔案 | 代表的時間 |
@@ -138,6 +154,8 @@
 | `enc_t_s` | run | encoder 取樣時間 (CS 拉 Low 的瞬間，AS5145 在這時鎖存角度) |
 | `imu_t_s` | run | IMU 新封包出現的時間 (有 DRDY = DRDY 上升緣；沒有 DRDY = 輪詢到的時間，最多晚 1 ms)。這週期沒有新封包就沿用上一筆 |
 | `imu_stf` | run | IMU **自己的時鐘** SampleTimeFine (0.1 ms)，用來檢查 IMU 跟 MCU 的時鐘漂移 |
+| `imuA_t_s` / `imuB_t_s` | run | UART IMU 最新封包第一個 byte 進來的時間 |
+| `imuA_stf` / `imuB_stf` | run | UART IMU 自己的時鐘 (IMU 有輸出 SampleTimeFine 才有，否則 0) |
 | `t_rx_s` | foot | STM32 收到這包足底資料最後一個 byte 的時間 |
 | `esp_us` | foot | **ESP32 自己的時鐘** (micros())，ESP32 收到 BLE 封包的時間，用來檢查 UART 延遲抖動 |
 
@@ -148,6 +166,7 @@
 | 欄位 | 說明 |
 |---|---|
 | `cycle` | 週期編號 (連號，用來檢查有沒有漏) |
+| `phase` | 1 = 原點 3 秒、2 = 測量 |
 | `t_s` `enc_t_s` `imu_t_s` | 見上表 |
 | `trig` | 2 = 輪詢到新 IMU 封包、1 = IMU DRDY、0 = Ticker / IMU 逾時 |
 | `encX_raw` | encoder 原始值 0~4095 (未歸零) |
@@ -159,6 +178,7 @@
 | `roll` `pitch` `yaw` | 姿態角 (deg) |
 | `gx` `gy` `gz` | 角速度 (deg/s) |
 | `ax` `ay` `az` | 加速度 (m/s²)，靜止時大小約 9.8 |
+| `imuA_*` / `imuB_*` | UART IMU A / B，欄位同 SPI IMU：`t_s new bad pc stf roll pitch yaw gx gy gz ax ay az`。UART IMU 跟主週期不同步，`new` 偶爾 0 (沿用上一筆) 或 2 (中間那包沒存)，看 `pc` 可確認 |
 | `footL_cnt` `footR_cnt` | 到這個週期為止收到的左 / 右腳封包數 (= foot 檔的 `seq`) |
 | `busy_us` | 這週期讀感測器花的時間 (約 1.5 ms) |
 | `dropped` | 累計丟掉的週期 (SD 太慢時才會增加，正常 0) |
@@ -168,6 +188,7 @@
 |---|---|
 | `seq` | 該腳第幾包 (左右各自從 1 開始) |
 | `foot` | `L` / `R` |
+| `phase` | 1 = 原點、2 = 測量 (依 `t_rx_s` 判斷) |
 | `t_rx_s` | STM32 收到的時間 (見上表) |
 | `cycle` | 收到時主檔最新的 `cycle` |
 | `esp_us` | ESP32 收到 BLE 的時間 (µs，約 71 分鐘繞回一次)；舊版 ESP32 程式為空白 |
@@ -206,10 +227,19 @@ FOOT L=20 (gap_max=62ms) R=20 (gap_max=58ms) total L/R=1203/1198 foot_bad=0 foot
 ```
 `L` / `R` 這一秒收到幾包 (0 = 那隻腳沒連上)、`gap_max` 最大間隔、`foot_bad` checksum 錯誤 (接線不良)、`foot_drop` STM32 佇列滿丟掉的 (正常 0)、`foot_jit` ESP32 → STM32 延遲抖動 (ESP32 沒送時間戳時顯示 `-`)。
 
+UART IMU 每秒封包數與錯誤數 (正常各 100、bad 0)：
+```
+UIMU A=100/s (bad 0) B=100/s (bad 0)
+```
+沒在紀錄時，再印一行是否準備好 (`NG` = 這項不正常、`-` = 設為非必要)：
+```
+READY=1  enc=OK spiIMU=OK imuA=OK imuB=OK foot=OK SD=OK  -> 按 B1 開始 (先記錄 3 秒原點)
+```
+
 | 指令 | 功能 |
 |---|---|
-| `g` / `x` | 開始 / 停止紀錄 (同 B1 短按) |
-| `z` | encoder 歸零 (同 B1 按住 3 秒) |
+| `g` / `x` | 開始 (原點 → 測量，沒準備好也強制開始) / 停止 |
+| `z` | encoder 歸零並存 flash (只能在沒紀錄時) |
 | `s` / `S` | 即時資料輸出 10 Hz / 50 Hz (再按一次關閉) |
 | `i` | 重新初始化 IMU (換 IMU 或接線後，不用重開機) |
 
@@ -227,7 +257,10 @@ mbed compile -m NUCLEO_F446RE -t GCC_ARM && openocd -f interface/stlink.cfg -f t
 
 | 症狀 (序列埠) | 原因 / 處理 |
 |---|---|
-| 綠燈快閃、`SD init failed: -5005` | 沒偵測到 SD 卡：檢查 CN7-1~4、電源、卡有插好；插好後短按 B1 |
+| 綠燈一直不亮、`READY` 行 `SD=NG` | 沒偵測到 SD 卡：檢查 CN7-1~4、電源、卡有插好；插好後每秒會自動重試 |
+| `READY` 行 `imuA=NG` / `imuB=NG`，`UIMU A=0/s` | UART IMU 沒資料：TX/RX 是否交叉接 (接反最常見)、GND、IMU 供電、鮑率 (`UIMU_BAUD`)；可用 `imu_uart_dual_100hz` 的 `s` 掃描鮑率 |
+| `UIMU` 有封包但 `bad` 一直增加 | 線太長 / 雜訊：降低鮑率，或訊號線旁邊配 GND 線 |
+| 準備好但不想等某個裝置 | 把 `REQ_*` 改 `false` 重燒，或用序列埠 `g` 強制開始 |
 | `SD mount failed` | 卡不是 FAT32，用電腦格式化 |
 | `IMU init: fw=00000000`，下一行 `diag … FFFFFFFF` | IMU 完全沒回應：IMU 沒電、CS/SCK/MISO 線斷 (今天換線後就好)、IMU 不在 SPI 模式 |
 | `IMU init: fw=00000000`，`diag … 00000000` | MISO 被拉 Low：接錯腳或短路 |

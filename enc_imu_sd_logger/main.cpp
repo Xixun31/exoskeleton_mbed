@@ -1,11 +1,13 @@
 // =====================================================================
-// 2 顆 AS5145 (daisy chain 串接) + 1 顆 SPI IMU (Xsens MTi) 以 100Hz 同步讀取，
+// 2 顆 AS5145 (daisy chain 串接) + 1 顆 SPI IMU + 2 顆 UART IMU (Xsens MTi) 以 100Hz 同步讀取，
 // 加上左右腳足底感測器 (BLE → ESP32 → UART)，全部用同一個 MCU µs 時鐘打時間戳，存到 microSD
 //
 // 每個裝置都有自己的 time code (MCU 時鐘，秒，µs 解析度)，可以檢查時間有沒有對齊：
 //   enc_t_s  : encoder CS 拉 Low 的時間 (AS5145 在 CSn 下降緣鎖存角度 = encoder 取樣時間)
 //   imu_t_s  : IMU 新封包出現的時間 (DRDY 模式 = DRDY 上升緣；輪詢模式 = 偵測到新封包的那次輪詢，最多晚 1ms)
 //   imu_stf  : IMU 自己的時鐘 SampleTimeFine (0.1ms)，可跟 imu_t_s 比較 IMU / MCU 時鐘漂移
+//   imuA_t_s / imuB_t_s : UART IMU 最新封包第一個 byte 進來的時間 (= IMU 開始送這包的時間)
+//   imuA_stf / imuB_stf : UART IMU 的 SampleTimeFine (IMU 有輸出才有，否則 0)
 //   foot t_rx_s : STM32 收到足底封包最後一個 byte 的時間 (另存 runXXX_foot.csv)
 //   foot esp_us : ESP32 收到 BLE 封包的 ESP32 時鐘 (micros())，可跟 t_rx_s 比較 UART 延遲與 ESP32 時鐘漂移
 //   tools/check_time_align.py 會讀兩個 CSV，算出各裝置的取樣間隔、漏包、時鐘漂移與延遲抖動
@@ -31,6 +33,9 @@
 //  [足底感測器 ESP32, USART1 115200]
 //   ESP32 GPIO17 (TX) → PA_10 (RX) CN10-33     ESP32 GND → GND (CN10-9 / CN7-19 等，一定要共地)
 //   PA_9 (TX) CN10-21 保留不接
+//  [UART IMU A, USART3 921600]  IMU TX → PC_5 (RX) CN10-6    IMU RX ← PB_10 (TX) CN10-25
+//  [UART IMU B, UART4  115200]  IMU TX → PA_1 (RX) CN7-30    IMU RX ← PA_0  (TX) CN7-28
+//   兩顆 IMU 的 GND 都要接板子 GND；鮑率要跟 IMU 設定一樣 (UIMU_BAUD)，不知道可用 imu_uart_dual_100hz 的 's' 掃描
 //  電源：3V3 CN7-16、5V CN7-18、GND CN7-8 / CN7-19 / CN7-20 / CN10-9 / CN10-20
 //
 //  AS5145 daisy chain：
@@ -39,19 +44,30 @@
 //   每顆 18 bit = D11..D0, OCF, COF, LIN, MagINC, MagDEC, Parity(偶同位)
 //
 // ---------------- 操作 ----------------
-//  開機自動開始紀錄到 /fs/exoskeleton_project_record/enc_imu_foot/runXXX.csv + runXXX_foot.csv (不覆蓋舊檔)
-//  藍色 B1 按鈕：短按 = 停止紀錄並安全卸載 SD (之後可拔卡)；再按一次 → 開新檔繼續紀錄
-//              按住 3 秒 = 兩顆 encoder 歸零 (目前位置 = 0 deg，存在內部 flash，斷電 / 重燒都保留)
-//  LD2 綠燈：慢閃 = 紀錄中、恆亮 = 已停止 (可拔卡)、快閃 = SD 錯誤
-//  序列埠 115200：每秒印一行狀態 (enc_err = 通訊錯誤、mag_warn = 磁場警告)。指令 's' / 'S' 切換即時資料輸出 10Hz / 50Hz (python/imu/live_plot_enc_imu.py 畫圖)、'g' 開始、'x' 停止、'i' 重新初始化 IMU、
-//  'z' encoder 歸零 (同 B1 按住 3 秒)
+//  1. 開機後持續檢查所有裝置 (每秒一次)：encoder 通訊正常、SPI IMU / UART IMU A / B 都約 100 包/秒、
+//     左右腳足底都有收到、SD 卡可用。全部 OK = 準備好 → LD2 綠燈恆亮 (沒準備好 = 熄滅，序列埠會印缺哪一項)
+//  2. 準備好之後按一下藍色 B1 (放開時開始)：開新檔 runXXX.csv / runXXX_foot.csv (不覆蓋舊檔)，
+//     先記錄 3 秒原點 (phase = 1，請保持不動，LD2 快閃)，結束時把每個通道 3 秒的平均存成 runXXX_origin.csv
+//  3. 原點記錄完自動進入測量 (phase = 2，LD2 慢閃)
+//  4. 測量中再按一下 B1 = 停止並關檔 (可以拔卡)，回到步驟 1
+//  原點期間 encoder 或 IMU 姿態變化超過 2 deg 時，序列埠會印 WARN (表示有動到，建議重來)
+//  序列埠 115200：每秒印狀態 (enc_err = 通訊錯誤、mag_warn = 磁場警告、UIMU = UART IMU 每秒封包數)。
+//  指令 's' / 'S' 切換即時資料輸出 10Hz / 50Hz (python/imu/live_plot_enc_imu.py 畫圖)、
+//  'g' 開始 (沒準備好也強制開始)、'x' 停止、'i' 重新初始化 SPI IMU、'z' encoder 歸零 (存 flash，只能在沒紀錄時用)
+//  REQ_* 常數可以設定哪些裝置是「準備好」的必要條件 (例如今天沒接足底就把 REQ_FOOT 改 false)
 //
 // ---------------- CSV 欄位 (runXXX.csv，100Hz) ----------------
-//  cycle,t_s,trig,enc_t_s,
+//  cycle,phase,t_s,trig,enc_t_s,
 //  enc1_raw,enc1_deg,enc1_stat,enc1_err,enc2_raw,enc2_deg,enc2_stat,enc2_err,
 //  imu_t_s,imu_new,imu_bad,imu_pc,imu_stf,roll,pitch,yaw,gx,gy,gz,ax,ay,az,
+//  imuA_t_s,imuA_new,imuA_bad,imuA_pc,imuA_stf,imuA_roll,...,imuA_az,   (UART IMU A，欄位同 SPI IMU)
+//  imuB_t_s,imuB_new,imuB_bad,imuB_pc,imuB_stf,imuB_roll,...,imuB_az,   (UART IMU B)
 //  footL_cnt,footR_cnt,busy_us,dropped
+//   phase    : 1 = 原點 (前 3 秒，保持不動)、2 = 測量
 //   t_s      : 週期開始的 MCU 時間 (秒，µs 解析度)
+//   imuA_new / imuB_new : 這個週期收到幾個新封包。UART IMU 自己以 100Hz 送，跟 SPI IMU 不同步，
+//              偶爾 0 (沿用上一筆) 或 2 (只留最新那筆)，用 imuX_pc 可以看出來
+//   imuA_bad / imuB_bad : 這個週期 checksum / 長度錯誤的封包數
 //   enc_t_s / imu_t_s : 見上面 time code 說明 (IMU 這週期沒有新封包時沿用上一筆)
 //   footL_cnt / footR_cnt : 到這個週期為止收到的左 / 右腳封包數 (= runXXX_foot.csv 的 seq，用來對照)
 //   trig     : 1 = IMU DRDY 觸發，2 = 輪詢到新 IMU 封包，0 = Ticker / IMU 逾時
@@ -66,13 +82,21 @@
 //   busy_us  : 這個週期讀完所有裝置花的時間；dropped = 佇列滿而丟掉的週期數 (累計)
 //
 // ---------------- CSV 欄位 (runXXX_foot.csv，每收到一包足底資料一行) ----------------
-//  seq,foot,t_rx_s,cycle,esp_us,esp_seq,P1..P18,total_g,cop_valid,cop_x_mm,cop_y_mm
+//  seq,foot,phase,t_rx_s,cycle,esp_us,esp_seq,P1..P18,total_g,cop_valid,cop_x_mm,cop_y_mm
 //   seq      : 該腳第幾包 (左右各自從 1 開始，對應主檔 footL_cnt / footR_cnt)
+//   phase    : 1 = 原點、2 = 測量 (依 t_rx_s 判斷)
 //   foot     : L / R
 //   t_rx_s   : STM32 收到最後一個 byte 的 MCU 時間 (與主檔 t_s 同一個時鐘)
 //   cycle    : 收到時主檔最新的週期編號 (主檔該 cycle 那一行之後收到)
 //   esp_us   : ESP32 收到 BLE 封包時的 micros() (32 bit，約 71 分鐘繞回)；舊版 ESP32 韌體沒有時間戳 → 空白
 //   esp_seq  : ESP32 對該腳的封包編號 (16 bit)，跳號 = UART 掉包；舊版韌體空白
+//
+// ---------------- runXXX_origin.csv (原點 3 秒的統計，每個通道一行) ----------------
+//  channel,mean,min,max,n,t_first_s,t_last_s
+//   channel  : enc1_deg、imu_roll…imu_az、imuA_*、imuB_*、footL_P1…footL_total_g、footR_*
+//   mean     : 3 秒平均 (角度有處理 ±180 繞回)；min / max = 3 秒內的範圍 (看有沒有動到)
+//   n        : 用了幾筆 (IMU 只算新封包、encoder 只算通訊正確的)
+//   t_first_s / t_last_s : 第一筆 / 最後一筆的 time code (該裝置自己的時間戳，跟主檔同一個時鐘)
 // =====================================================================
 #include "mbed.h"
 #include "SDBlockDevice.h"
@@ -102,7 +126,17 @@ DigitalOut led(LED1);            // PA5 (LD2)
 const int FOOT_BAUD = 115200;
 UnbufferedSerial foot_uart(PA_9, PA_10, FOOT_BAUD);  // tx (不接), rx
 
+// UART IMU：A = USART3 (PB_10 TX, PC_5 RX)、B = UART4 (PA_0 TX, PA_1 RX)。鮑率要跟各 IMU 的設定一樣
+const int N_UIMU = 2;
+const int UIMU_BAUD[N_UIMU] = {921600, 115200};
+
+// 「準備好」(LD2 恆亮) 需要哪些裝置正常；今天沒接的裝置改 false
+const bool REQ_ENC = true, REQ_SPI_IMU = true, REQ_UART_IMU = true, REQ_FOOT = true;
+const int READY_MIN_RATE = 90;  // IMU / 週期每秒至少幾筆才算正常
+
 const auto PERIOD = 10ms;  // 100Hz
+const uint64_t ORIGIN_US = 3000000;  // 原點記錄 3 秒
+const float ORIGIN_MOVE_DEG = 2.0f;  // 原點期間角度變化超過這個值就警告
 const float RAD2DEG = 57.2957795f;
 const char* LOG_DIR = "/fs/exoskeleton_project_record/enc_imu_foot";
 
@@ -272,14 +306,20 @@ struct Sample {
     uint64_t enc_t_us;  // encoder CS 下降緣 (AS5145 鎖存角度的時間)
     uint64_t imu_t_us;  // 最新 IMU 封包出現的時間
     uint8_t trig;
+    uint8_t phase;      // 0 = 沒在紀錄、1 = 原點、2 = 測量
     EncData enc[N_ENC];
     ImuData imu;
+    ImuData uimu[2];         // UART IMU A / B
+    uint64_t uimu_t_us[2];   // UART IMU 最新封包第一個 byte 的時間
     uint32_t foot_cnt[2];  // 到目前為止左 / 右腳收到幾包
     uint16_t busy;
     uint32_t dropped;
 };
-Mail<Sample, 256> mail;
+Mail<Sample, 200> mail;  // 2 秒緩衝 (SD 卡偶爾卡 100ms 以上)
 volatile uint32_t dropped = 0;
+// 紀錄狀態：main 執行緒設定 (先設 origin_end_us 再設 rec_on)，取樣執行緒依週期開始時間決定 phase
+volatile bool rec_on = false;
+volatile uint64_t origin_end_us = 0;
 Timer clock_us;
 
 uint64_t now_us() { return clock_us.elapsed_time().count(); }
@@ -383,6 +423,25 @@ const float FOOT_Y[FOOT_N] = {2600.1604f, 2637.9524f, 2444.2083f, 2482.2769f, 25
 const float FOOT_ORIGIN_X = 1984.7721f, FOOT_ORIGIN_Y = 2415.3761f;  // 之後決定腳跟原點後改這裡
 const float FOOT_FORCE_THRESHOLD = 50.0f;                            // 空載雜訊門檻 (g)
 
+// 解析一個 MTData2 訊息的資料區 (一串 XDI + size + content)，更新最新值。SPI / UART IMU 共用
+void parse_mtdata2(const uint8_t* d, int n, ImuData& s) {
+    int i = 0;
+    while (i + 3 <= n) {
+        uint16_t xdi = (d[i] << 8) | d[i + 1];
+        int size = d[i + 2];
+        const uint8_t* c = &d[i + 3];
+        if (i + 3 + size > n) break;
+        switch (xdi & 0xFFF0) {
+            case 0x1020: if (size == 2) s.pc = (c[0] << 8) | c[1]; break;
+            case 0x1060: if (size == 4) s.stf = ((uint32_t)c[0] << 24) | (c[1] << 16) | (c[2] << 8) | c[3]; break;
+            case 0x2030: if (size == 12) for (int k = 0; k < 3; k++) s.euler[k] = be_float(c + 4 * k); break;
+            case 0x4020: if (size == 12) for (int k = 0; k < 3; k++) s.acc[k] = be_float(c + 4 * k); break;
+            case 0x8020: if (size == 12) for (int k = 0; k < 3; k++) s.gyr[k] = be_float(c + 4 * k) * RAD2DEG; break;
+        }
+        i += 3 + size;
+    }
+}
+
 // 解析一段 measurement pipe 資料 (可能含多個 MTData2 訊息)，更新最新值
 void parse_measurement(const uint8_t* buf, int len, ImuData& s) {
     int off = 0;
@@ -393,24 +452,97 @@ void parse_measurement(const uint8_t* buf, int len, ImuData& s) {
             return;
         }
         s.n_new++;
-        int i = off + 2, end = off + 2 + buf[off + 1];
-        while (i + 3 <= end) {
-            uint16_t xdi = (buf[i] << 8) | buf[i + 1];
-            int size = buf[i + 2];
-            const uint8_t* c = &buf[i + 3];
-            if (i + 3 + size > end) break;
-            switch (xdi & 0xFFF0) {
-                case 0x1020: if (size == 2) s.pc = (c[0] << 8) | c[1]; break;
-                case 0x1060: if (size == 4) s.stf = ((uint32_t)c[0] << 24) | (c[1] << 16) | (c[2] << 8) | c[3]; break;
-                case 0x2030: if (size == 12) for (int k = 0; k < 3; k++) s.euler[k] = be_float(c + 4 * k); break;
-                case 0x4020: if (size == 12) for (int k = 0; k < 3; k++) s.acc[k] = be_float(c + 4 * k); break;
-                case 0x8020: if (size == 12) for (int k = 0; k < 3; k++) s.gyr[k] = be_float(c + 4 * k) * RAD2DEG; break;
-            }
-            i += 3 + size;
-        }
+        parse_mtdata2(&buf[off + 2], buf[off + 1], s);
         off += mlen;
     }
 }
+
+// ---------------- UART IMU (同 imu_uart_dual_100hz 測試程式) ----------------
+// 中斷裡逐 byte 解析 Xbus 封包：FA FF MID LEN payload CHECKSUM (FF + MID + LEN + payload + CHECKSUM 低 8 bit = 0)
+// 取樣執行緒每個週期用 fetch() 拿最新一筆
+class MtiUart {
+public:
+    volatile uint32_t rx_bytes = 0, pkt_ok = 0, pkt_bad = 0;
+
+    MtiUart(PinName tx, PinName rx, int baud) : serial(tx, rx, baud) {}
+
+    void start() { serial.attach(callback(this, &MtiUart::rx_isr), SerialBase::RxIrq); }
+    void stop() { serial.attach(nullptr, SerialBase::RxIrq); }
+
+    // 送無資料的指令 (例如 0x10 GoToMeasurement)
+    void send_cmd(uint8_t m) {
+        uint8_t msg[5] = {0xFA, 0xFF, m, 0x00, (uint8_t)(0x100 - ((0xFF + m) & 0xFF))};
+        serial.write(msg, 5);
+    }
+
+    // 複製最新一筆；d.n_new / d.bad = 上次呼叫到現在的新封包數 / 錯誤封包數，t = 最新封包第一個 byte 的時間
+    void fetch(ImuData& d, uint64_t& t) {
+        core_util_critical_section_enter();
+        d = latest;
+        t = latest_t;
+        uint32_t n = pkt_ok - fetched_ok, b = pkt_bad - fetched_bad;
+        fetched_ok = pkt_ok;
+        fetched_bad = pkt_bad;
+        core_util_critical_section_exit();
+        d.n_new = n > 255 ? 255 : n;
+        d.bad = b > 255 ? 255 : b;
+    }
+
+private:
+    UnbufferedSerial serial;
+    ImuData latest = {};
+    uint64_t latest_t = 0, t_start = 0;
+    uint32_t fetched_ok = 0, fetched_bad = 0;
+    enum { S_PRE, S_BID, S_MID, S_LEN, S_DATA, S_CKS } state = S_PRE;
+    uint8_t mid = 0, len = 0, idx = 0, sum = 0;
+    uint8_t buf[256];
+
+    void feed(uint8_t b, uint64_t t) {
+        switch (state) {
+            case S_PRE:
+                if (b == 0xFA) { t_start = t; state = S_BID; }
+                break;
+            case S_BID:
+                if (b == 0xFF) { sum = b; state = S_MID; }
+                else if (b == 0xFA) t_start = t;
+                else state = S_PRE;
+                break;
+            case S_MID: mid = b; sum += b; state = S_LEN; break;
+            case S_LEN:
+                len = b; sum += b; idx = 0;
+                if (len == 0xFF) { pkt_bad++; state = S_PRE; }  // extended length 不支援
+                else state = len == 0 ? S_CKS : S_DATA;
+                break;
+            case S_DATA:
+                buf[idx++] = b; sum += b;
+                if (idx >= len) state = S_CKS;
+                break;
+            case S_CKS:
+                sum += b;
+                if (sum != 0) pkt_bad++;
+                else if (mid == MID_MTDATA2) {
+                    parse_mtdata2(buf, len, latest);
+                    latest_t = t_start;
+                    pkt_ok++;
+                }
+                state = S_PRE;
+                break;
+        }
+    }
+
+    void rx_isr() {
+        uint64_t t = now_us();
+        uint8_t c;
+        while (serial.readable()) {
+            if (serial.read(&c, 1) != 1) break;
+            rx_bytes++;
+            feed(c, t);
+        }
+    }
+};
+
+MtiUart uimu[N_UIMU] = {{PB_10, PC_5, UIMU_BAUD[0]}, {PA_0, PA_1, UIMU_BAUD[1]}};
+const char UIMU_NAME[N_UIMU] = {'A', 'B'};
 
 void read_imu(ImuData& s) {
     if (!imu_ok) return;
@@ -585,6 +717,8 @@ void sample_loop() {
         uint64_t t_imu_read = now_us();
         read_imu(s.imu);
         if (s.imu.n_new > 0) s.imu_t_us = (trig != 0 && imu_seen) ? imu_seen : t_imu_read;  // 沒新封包就沿用上一筆
+        for (int k = 0; k < N_UIMU; k++) uimu[k].fetch(s.uimu[k], s.uimu_t_us[k]);
+        s.phase = !rec_on ? 0 : (t0 < origin_end_us ? 1 : 2);
         for (int i = 0; i < 2; i++) s.foot_cnt[i] = foot_cnt[i];
         s.busy = (uint16_t)(now_us() - t0);
         s.dropped = dropped;
@@ -617,21 +751,44 @@ void close_files() {
     log_file = foot_file = nullptr;
 }
 
-bool open_log_file() {
-    if (!sd_mounted) {
-        int err = sd.init();
-        if (err != 0) {
-            printf("SD init failed: %d\r\n", err);
-            return false;
-        }
-        err = fs.mount(&sd);
-        if (err != 0) {
-            printf("SD mount failed: %d (請確認為 FAT32)\r\n", err);
-            sd.deinit();
-            return false;
-        }
-        sd_mounted = true;
+void unmount_sd() {
+    if (!sd_mounted) return;
+    fs.unmount();
+    sd.deinit();
+    sd_mounted = false;
+}
+
+bool mount_sd(bool verbose = true) {
+    if (sd_mounted) return true;
+    int err = sd.init();
+    if (err != 0) {
+        if (verbose) printf("SD init failed: %d\r\n", err);
+        return false;
     }
+    err = fs.mount(&sd);
+    if (err != 0) {
+        if (verbose) printf("SD mount failed: %d (請確認為 FAT32)\r\n", err);
+        sd.deinit();
+        return false;
+    }
+    sd_mounted = true;
+    return true;
+}
+
+// 沒在紀錄時每秒檢查 SD 卡還在不在 (拔掉 → 卸載；插回 → 重新掛載)
+bool check_sd() {
+    if (sd_mounted) {
+        static uint8_t blk[512];
+        if (sd.read(blk, 0, 512) == 0) return true;  // 直接讀卡 (不經過 FAT 快取)，卡拔掉會失敗
+        unmount_sd();
+    }
+    return mount_sd(false);
+}
+
+int cur_run = 0;
+
+bool open_log_file() {
+    if (!mount_sd()) return false;
     mkdir("/fs/exoskeleton_project_record", 0777);  // 已存在時失敗可忽略
     mkdir(LOG_DIR, 0777);
 
@@ -648,6 +805,7 @@ bool open_log_file() {
         printf("找不到可用檔名 run001~run999.csv\r\n");
         return false;
     }
+    cur_run = run;
     snprintf(foot_path, sizeof(foot_path), "%s/run%03d_foot.csv", LOG_DIR, run);
     log_file = fopen(log_path, "w");
     foot_file = log_file ? fopen(foot_path, "w") : nullptr;
@@ -659,10 +817,17 @@ bool open_log_file() {
     setvbuf(log_file, sd_stdio_buffer, _IOFBF, sizeof(sd_stdio_buffer));
     setvbuf(foot_file, foot_stdio_buffer, _IOFBF, sizeof(foot_stdio_buffer));
     fprintf(log_file,
-            "cycle,t_s,trig,enc_t_s,enc1_raw,enc1_deg,enc1_stat,enc1_err,enc2_raw,enc2_deg,enc2_stat,enc2_err,"
-            "imu_t_s,imu_new,imu_bad,imu_pc,imu_stf,roll,pitch,yaw,gx,gy,gz,ax,ay,az,"
-            "footL_cnt,footR_cnt,busy_us,dropped\n");
-    fprintf(foot_file, "seq,foot,t_rx_s,cycle,esp_us,esp_seq");
+            "cycle,phase,t_s,trig,enc_t_s,enc1_raw,enc1_deg,enc1_stat,enc1_err,enc2_raw,enc2_deg,enc2_stat,enc2_err,"
+            "imu_t_s,imu_new,imu_bad,imu_pc,imu_stf,roll,pitch,yaw,gx,gy,gz,ax,ay,az,");
+    for (int k = 0; k < N_UIMU; k++) {
+        char c = UIMU_NAME[k];
+        fprintf(log_file,
+                "imu%c_t_s,imu%c_new,imu%c_bad,imu%c_pc,imu%c_stf,imu%c_roll,imu%c_pitch,imu%c_yaw,"
+                "imu%c_gx,imu%c_gy,imu%c_gz,imu%c_ax,imu%c_ay,imu%c_az,",
+                c, c, c, c, c, c, c, c, c, c, c, c, c, c);
+    }
+    fprintf(log_file, "footL_cnt,footR_cnt,busy_us,dropped\n");
+    fprintf(foot_file, "seq,foot,phase,t_rx_s,cycle,esp_us,esp_seq");
     for (int i = 1; i <= FOOT_N; i++) fprintf(foot_file, ",P%d", i);
     fprintf(foot_file, ",total_g,cop_valid,cop_x_mm,cop_y_mm\n");
     fflush(log_file);
@@ -683,15 +848,10 @@ void stop_recording() {
         fflush(log_file);
         fflush(foot_file);
         close_files();
-        printf("REC stop: %s, %lu lines, foot %lu lines\r\n", log_path, (unsigned long)lines_written,
-               (unsigned long)foot_lines);
+        printf("REC stop: %s, %lu lines, foot %lu lines (檔案已關閉，可以拔卡)\r\n", log_path,
+               (unsigned long)lines_written, (unsigned long)foot_lines);
     }
-    if (sd_mounted) {
-        fs.unmount();
-        sd.deinit();
-        sd_mounted = false;
-        printf("SD unmounted，可以拔卡\r\n");
-    }
+    // SD 保持掛載，才能馬上判斷「準備好」；檔案都關了，直接拔卡不會壞檔 (拔掉會被 check_sd 偵測到)
 }
 
 bool sync_file(FILE* f) { return fflush(f) == 0 && fsync(fileno(f)) == 0 && !ferror(f); }
@@ -702,9 +862,7 @@ bool sync_recording() {
     if (!sync_file(log_file) || !sync_file(foot_file)) {
         printf("SD write error (errno=%d)，停止紀錄\r\n", errno);
         close_files();
-        fs.unmount();
-        sd.deinit();
-        sd_mounted = false;
+        unmount_sd();
         sd_error = true;
         return false;
     }
@@ -716,26 +874,32 @@ void fprint_t(FILE* f, uint64_t t_us) {
     fprintf(f, "%lu.%06lu", (unsigned long)(t_us / 1000000), (unsigned long)(t_us % 1000000));
 }
 
+// 一顆 IMU 的欄位：,t_s,new,bad,pc,stf,roll,pitch,yaw,gx,gy,gz,ax,ay,az
+void write_imu(FILE* f, uint64_t t_us, const ImuData& m) {
+    fprintf(f, ",");
+    fprint_t(f, t_us);
+    fprintf(f, ",%u,%u,%u,%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f", m.n_new, m.bad, m.pc,
+            (unsigned long)m.stf, m.euler[0], m.euler[1], m.euler[2], m.gyr[0], m.gyr[1], m.gyr[2], m.acc[0],
+            m.acc[1], m.acc[2]);
+}
+
 void write_sample(FILE* f, const Sample& s) {
-    fprintf(f, "%lu,", (unsigned long)s.cycle);
+    fprintf(f, "%lu,%u,", (unsigned long)s.cycle, s.phase);
     fprint_t(f, s.t_us);
     fprintf(f, ",%u,", s.trig);
     fprint_t(f, s.enc_t_us);
     for (int i = 0; i < N_ENC; i++) {
         fprintf(f, ",%u,%.2f,%02X,%u", s.enc[i].raw, s.enc[i].deg, s.enc[i].stat, s.enc[i].err);
     }
-    const ImuData& m = s.imu;
-    fprintf(f, ",");
-    fprint_t(f, s.imu_t_us);
-    fprintf(f, ",%u,%u,%u,%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%lu,%lu,%u,%lu\n", m.n_new, m.bad, m.pc,
-            (unsigned long)m.stf, m.euler[0], m.euler[1], m.euler[2], m.gyr[0], m.gyr[1], m.gyr[2], m.acc[0],
-            m.acc[1], m.acc[2], (unsigned long)s.foot_cnt[0], (unsigned long)s.foot_cnt[1], s.busy,
+    write_imu(f, s.imu_t_us, s.imu);
+    for (int k = 0; k < N_UIMU; k++) write_imu(f, s.uimu_t_us[k], s.uimu[k]);
+    fprintf(f, ",%lu,%lu,%u,%lu\n", (unsigned long)s.foot_cnt[0], (unsigned long)s.foot_cnt[1], s.busy,
             (unsigned long)s.dropped);
 }
 
 // 足底：總重 + COP (算法同 Foot_sensor/main.cpp；總重小於門檻時 COP 留空)
-void write_foot(FILE* f, const FootFrame& fr) {
-    fprintf(f, "%lu,%c,", (unsigned long)fr.seq, fr.foot == 0 ? 'L' : 'R');
+void write_foot(FILE* f, const FootFrame& fr, int phase) {
+    fprintf(f, "%lu,%c,%d,", (unsigned long)fr.seq, fr.foot == 0 ? 'L' : 'R', phase);
     fprint_t(f, fr.t_rx_us);
     fprintf(f, ",%lu,", (unsigned long)fr.cycle);
     if (fr.has_esp) fprintf(f, "%lu,%u", (unsigned long)fr.esp_us, fr.esp_seq);
@@ -751,6 +915,125 @@ void write_foot(FILE* f, const FootFrame& fr) {
     else fprintf(f, ",%lu,0,,\n", (unsigned long)sum);
 }
 
+// ---------------- 原點 (按下開始後的 3 秒) ----------------
+// 每個通道累加相對第一筆的差值 (角度處理 ±180 繞回)，結束時算平均 / 範圍，存 runXXX_origin.csv
+struct OriginAcc {
+    float ref, sum, mn, mx;
+    uint32_t n;
+    uint64_t t_first, t_last;
+    void add(float v, uint64_t t, bool wrap) {
+        if (n == 0) {
+            ref = v;
+            sum = mn = mx = 0;
+            t_first = t;
+        }
+        float d = v - ref;
+        if (wrap) d = remainderf(d, 360.0f);  // -180 ~ +180
+        sum += d;
+        if (d < mn) mn = d;
+        if (d > mx) mx = d;
+        n++;
+        t_last = t;
+    }
+    float mean(bool wrap) const {
+        float m = ref + sum / n;
+        return wrap ? remainderf(m, 360.0f) : m;
+    }
+};
+
+// 通道順序：enc1、enc2、3 顆 IMU x 9 (roll pitch yaw gx gy gz ax ay az)、左右腳 x (P1..P18 + total)
+const int OR_ENC = 0, OR_IMU = N_ENC, OR_FOOT = OR_IMU + 3 * 9, OR_N = OR_FOOT + 2 * (FOOT_N + 1);
+OriginAcc origin_acc[OR_N];
+const char* IMU_FIELD[9] = {"roll", "pitch", "yaw", "gx", "gy", "gz", "ax", "ay", "az"};
+const char* IMU_PREFIX[3] = {"imu", "imuA", "imuB"};
+
+void origin_reset() { memset(origin_acc, 0, sizeof(origin_acc)); }
+
+void origin_add_imu(int k, const ImuData& m, uint64_t t) {
+    if (m.n_new == 0) return;  // 只算新封包，不重複算同一筆
+    const float* v[3] = {m.euler, m.gyr, m.acc};
+    for (int j = 0; j < 9; j++) origin_acc[OR_IMU + 9 * k + j].add(v[j / 3][j % 3], t, j < 3);
+}
+
+void origin_add_sample(const Sample& s) {
+    for (int i = 0; i < N_ENC; i++)
+        if (!(s.enc[i].err & 0x27)) origin_acc[OR_ENC + i].add(s.enc[i].deg, s.enc_t_us, true);
+    origin_add_imu(0, s.imu, s.imu_t_us);
+    for (int k = 0; k < N_UIMU; k++) origin_add_imu(1 + k, s.uimu[k], s.uimu_t_us[k]);
+}
+
+void origin_add_foot(const FootFrame& fr) {
+    int base = OR_FOOT + fr.foot * (FOOT_N + 1);
+    float sum = 0;
+    for (int i = 0; i < FOOT_N; i++) {
+        origin_acc[base + i].add(fr.p[i], fr.t_rx_us, false);
+        sum += fr.p[i];
+    }
+    origin_acc[base + FOOT_N].add(sum, fr.t_rx_us, false);
+}
+
+void origin_channel_name(int c, char* name, int len) {
+    if (c < OR_IMU) snprintf(name, len, "enc%d_deg", c + 1);
+    else if (c < OR_FOOT) snprintf(name, len, "%s_%s", IMU_PREFIX[(c - OR_IMU) / 9], IMU_FIELD[(c - OR_IMU) % 9]);
+    else {
+        int f = (c - OR_FOOT) / (FOOT_N + 1), i = (c - OR_FOOT) % (FOOT_N + 1);
+        if (i < FOOT_N) snprintf(name, len, "foot%c_P%d", f ? 'R' : 'L', i + 1);
+        else snprintf(name, len, "foot%c_total_g", f ? 'R' : 'L');
+    }
+}
+
+bool origin_is_angle(int c) { return c < OR_IMU || (c < OR_FOOT && (c - OR_IMU) % 9 < 3); }
+
+// 寫 runXXX_origin.csv，並在序列埠印出摘要；回傳原點期間角度最大變化 (deg)
+float write_origin() {
+    char path[80];
+    snprintf(path, sizeof(path), "%s/run%03d_origin.csv", LOG_DIR, cur_run);
+    FILE* f = fopen(path, "w");
+    if (f) fprintf(f, "channel,mean,min,max,n,t_first_s,t_last_s\n");
+    float move_max = 0;
+    char worst[24] = "-";
+    for (int c = 0; c < OR_N; c++) {
+        const OriginAcc& a = origin_acc[c];
+        char name[24];
+        origin_channel_name(c, name, sizeof(name));
+        bool ang = origin_is_angle(c);
+        if (a.n && ang && a.mx - a.mn > move_max) {
+            move_max = a.mx - a.mn;
+            strcpy(worst, name);
+        }
+        if (!f) continue;
+        if (a.n == 0) {
+            fprintf(f, "%s,,,,0,,\n", name);  // 這個裝置原點期間沒有資料
+            continue;
+        }
+        float lo = a.ref + a.mn, hi = a.ref + a.mx;
+        if (ang) {
+            lo = remainderf(lo, 360.0f);
+            hi = remainderf(hi, 360.0f);
+        }
+        fprintf(f, "%s,%.4f,%.4f,%.4f,%lu,", name, a.mean(ang), lo, hi, (unsigned long)a.n);
+        fprint_t(f, a.t_first);
+        fprintf(f, ",");
+        fprint_t(f, a.t_last);
+        fprintf(f, "\n");
+    }
+    bool ok = f && fclose(f) == 0;
+    printf("ORIGIN: %s %s\r\n", path, ok ? "saved" : "寫入失敗");
+    printf("ORIGIN: enc1=%.2f enc2=%.2f deg | imu R/P/Y=%.2f/%.2f/%.2f | A=%.2f/%.2f/%.2f | B=%.2f/%.2f/%.2f | "
+           "footL=%.0fg footR=%.0fg\r\n",
+           origin_acc[OR_ENC].n ? origin_acc[OR_ENC].mean(true) : NAN,
+           origin_acc[OR_ENC + 1].n ? origin_acc[OR_ENC + 1].mean(true) : NAN,
+           origin_acc[OR_IMU].mean(true), origin_acc[OR_IMU + 1].mean(true), origin_acc[OR_IMU + 2].mean(true),
+           origin_acc[OR_IMU + 9].mean(true), origin_acc[OR_IMU + 10].mean(true), origin_acc[OR_IMU + 11].mean(true),
+           origin_acc[OR_IMU + 18].mean(true), origin_acc[OR_IMU + 19].mean(true), origin_acc[OR_IMU + 20].mean(true),
+           origin_acc[OR_FOOT + FOOT_N].n ? origin_acc[OR_FOOT + FOOT_N].mean(false) : 0.0f,
+           origin_acc[OR_FOOT + 2 * FOOT_N + 1].n ? origin_acc[OR_FOOT + 2 * FOOT_N + 1].mean(false) : 0.0f);
+    if (move_max > ORIGIN_MOVE_DEG)
+        printf("WARN: 原點期間 %s 變化 %.2f deg (> %.1f)，可能有動到，建議停止後重來\r\n", worst, move_max,
+               ORIGIN_MOVE_DEG);
+    return move_max;
+}
+
 void print_encoder_check() {
     uint64_t v = read_encoder_bits();
     printf("ENC raw40=%02X%08lX\r\n", (unsigned)(v >> 32), (unsigned long)(v & 0xFFFFFFFF));
@@ -761,6 +1044,9 @@ void print_encoder_check() {
     }
 }
 
+
+enum RunState { ST_IDLE, ST_ORIGIN, ST_MEASURE };
+
 int main() {
     spi_enc.format(8, 2);  // AS5145：CLK 平時 High，下降緣取樣 (同 encoder/main.cpp 的 Mode 2)
     spi_enc.frequency(ENC_SPI_FREQ);
@@ -768,10 +1054,13 @@ int main() {
     spi_imu.frequency(IMU_SPI_FREQ);
     user_button.mode(PullUp);
     clock_us.start();
+    led = 0;
 
-    printf("\r\n==== 2x AS5145 + IMU + foot sensor -> microSD @100Hz ====\r\n");
+    printf("\r\n==== 2x AS5145 + SPI IMU + 2x UART IMU + foot sensor -> microSD @100Hz ====\r\n");
     foot_uart.attach(callback(on_foot_rx), SerialBase::RxIrq);  // 足底 UART 一開機就開始收
+    for (int k = 0; k < N_UIMU; k++) uimu[k].start();
     ThisThread::sleep_for(3000ms);  // 等 IMU 開機
+    for (int k = 0; k < N_UIMU; k++) uimu[k].send_cmd(MID_GOTOMEAS);  // UART IMU 停在 Config 模式時叫它開始輸出
 
     init_imu();
     load_zero();
@@ -781,28 +1070,62 @@ int main() {
         use_drdy = true;
         imu_drdy.rise(callback(on_drdy));
     } else {
-        printf("WARN: IMU 未初始化，使用 100Hz ticker，只記錄 encoder\r\n");
+        printf("WARN: SPI IMU 未初始化，使用 100Hz ticker\r\n");
         use_ticker();
     }
     sample_thread.start(sample_loop);
-    start_recording();  // 放在取樣開始之後：SD 沒插或初始化很慢時，感測器照常讀取
+    mount_sd();  // 放在取樣開始之後：SD 沒插或初始化很慢時，感測器照常讀取
 
     FileHandle* console = mbed_file_handle(STDIN_FILENO);
     int live_div = 0;  // 即時輸出：0 = 關、10 = 每 10 個週期一筆 (10Hz)、2 = 50Hz
+
+    // 狀態：IDLE (沒在紀錄；準備好 = LD2 恆亮) → 按 B1 → ORIGIN (3 秒) → MEASURE → 按 B1 → IDLE
+    RunState st = ST_IDLE;
+    bool ready = false;
+    uint64_t origin_t0 = 0;
+    bool origin_seen_meas = false;  // 已經收到 phase = 2 的週期 (原點的週期都處理完了)
+
+    auto start_run = [&]() {
+        if (st != ST_IDLE) return;
+        if (!start_recording()) {
+            printf("REC: SD 開檔失敗，無法開始\r\n");
+            return;
+        }
+        origin_reset();
+        origin_seen_meas = false;
+        origin_t0 = now_us();
+        origin_end_us = origin_t0 + ORIGIN_US;
+        rec_on = true;
+        st = ST_ORIGIN;
+        printf("ORIGIN: 記錄原點 %d 秒，請保持不動...\r\n", (int)(ORIGIN_US / 1000000));
+    };
+    auto stop_run = [&]() {
+        if (st == ST_IDLE) return;
+        rec_on = false;
+        st = ST_IDLE;
+        stop_recording();
+    };
+
+    // encoder 歸零 (存 flash)
     int zero_n = 0;                 // > 0：歸零中，還要收集幾筆
     int32_t zero_sum[N_ENC] = {};   // 相對第一筆的差值總和 (處理 4095→0 跨越)
     uint16_t zero_ref[N_ENC] = {};
     int zero_got = 0;
-    bool long_done = false;
     auto request_zero = [&]() {
+        if (st != ST_IDLE) {
+            printf("ZERO: 紀錄中不能歸零 (寫 flash 會讓取樣停 1~2 秒)，先停止紀錄\r\n");
+            return;
+        }
         zero_n = 50;
         zero_got = 0;
         printf("ZERO: 收集 50 筆中，請保持不動...\r\n");
     };
+
     bool button_prev = false;
     uint64_t button_t = 0, last_status = now_us(), last_led = 0;
     uint32_t n_sec = 0, enc_err[N_ENC] = {}, enc_warn[N_ENC] = {}, imu_miss = 0, imu_bad = 0, trig_drdy = 0;
     uint16_t busy_max = 0;
+    uint32_t uimu_prev_ok[N_UIMU] = {}, uimu_prev_bad[N_UIMU] = {};
     // 足底每秒統計：收到幾包、最大間隔、ESP32→STM32 延遲的抖動 (max - min)
     uint32_t foot_n[2] = {}, foot_gap_max[2] = {}, foot_esp_n = 0;
     uint64_t foot_last_t[2] = {};
@@ -810,11 +1133,15 @@ int main() {
     int32_t lat_min = 0, lat_max = 0;
 
     while (true) {
-        // 足底封包：寫 runXXX_foot.csv + 統計
+        // 足底封包：寫 runXXX_foot.csv + 原點統計 + 每秒統計
         while (FootFrame* fr = foot_mail.try_get()) {
-            if (foot_file) {
-                write_foot(foot_file, *fr);
-                foot_lines++;
+            if (st != ST_IDLE && fr->t_rx_us >= origin_t0) {
+                int phase = fr->t_rx_us < origin_end_us ? 1 : 2;
+                if (foot_file) {
+                    write_foot(foot_file, *fr, phase);
+                    foot_lines++;
+                }
+                if (st == ST_ORIGIN && phase == 1) origin_add_foot(*fr);
             }
             int k = fr->foot;
             foot_n[k]++;
@@ -836,9 +1163,13 @@ int main() {
 
         Sample* s = mail.try_get_for(5ms);
         if (s) {
-            if (log_file) {
+            if (log_file && s->phase != 0) {  // 按下開始之前還在佇列裡的週期 (phase 0) 不寫
                 write_sample(log_file, *s);
                 lines_written++;
+            }
+            if (st == ST_ORIGIN) {
+                if (s->phase == 1) origin_add_sample(*s);
+                else if (s->phase == 2) origin_seen_meas = true;
             }
             if (live_div && s->cycle % live_div == 0) {
                 printf("D,%lu,%.2f,%u,%.2f,%u,%u,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%.2f,%.2f,%.2f\r\n",
@@ -865,11 +1196,13 @@ int main() {
                         enc_zero[i] = z[i];
                     }
                     zero_valid = true;
-                    // 抹除 flash 時 CPU 會停住；先停掉 1kHz Ticker / DRDY 中斷，不然 RTOS 的 ISR 佇列會塞爆當機
+                    // 抹除 flash 時 CPU 會停住；先停掉 1kHz Ticker / DRDY / UART 中斷，不然 RTOS 的 ISR 佇列會塞爆當機
                     sample_ticker.detach();
                     imu_drdy.rise(nullptr);
-                    foot_uart.attach(nullptr, SerialBase::RxIrq);  // 足底也暫停 (這段時間的足底封包會遺失)
+                    foot_uart.attach(nullptr, SerialBase::RxIrq);  // 這段時間的足底 / UART IMU 封包會遺失
+                    for (int k = 0; k < N_UIMU; k++) uimu[k].stop();
                     bool ok = save_zero(z);
+                    for (int k = 0; k < N_UIMU; k++) uimu[k].start();
                     foot_uart.attach(callback(on_foot_rx), SerialBase::RxIrq);
                     if (use_drdy) imu_drdy.rise(callback(on_drdy));
                     else sample_ticker.attach(callback(on_tick), use_poll ? POLL_PERIOD : PERIOD);
@@ -890,16 +1223,39 @@ int main() {
 
         uint64_t now = now_us();
 
-        // 每秒：寫回 SD + 印狀態
+        // 原點 3 秒結束：原點的週期都處理完 (已經收到 phase 2) 且足底封包也到齊 (多等 100ms) → 存原點、開始測量
+        if (st == ST_ORIGIN && origin_seen_meas && now >= origin_end_us + 100000) {
+            write_origin();
+            st = ST_MEASURE;
+            printf("MEAS: 開始測量 (再按一次 B1 停止)\r\n");
+        }
+        // 紀錄中 SD 出錯 (sync_recording 已關檔)：回到 IDLE
+        if (st != ST_IDLE && !log_file) {
+            rec_on = false;
+            st = ST_IDLE;
+            printf("REC: SD 錯誤，紀錄已停止\r\n");
+        }
+
+        // 每秒：寫回 SD + 印狀態 + 檢查是否準備好
         if (now - last_status >= 1000000) {
             last_status = now;
             sync_recording();
+            uint32_t urate[N_UIMU], ubad[N_UIMU];
+            for (int k = 0; k < N_UIMU; k++) {
+                uint32_t ok = uimu[k].pkt_ok, bad = uimu[k].pkt_bad;
+                urate[k] = ok - uimu_prev_ok[k];
+                ubad[k] = bad - uimu_prev_bad[k];
+                uimu_prev_ok[k] = ok;
+                uimu_prev_bad[k] = bad;
+            }
             printf("STAT rec=%d lines=%lu rate=%lu imu_trig=%lu enc_err=%lu/%lu mag_warn=%lu/%lu imu_miss=%lu imu_bad=%lu busy_max=%uus "
                    "dropped=%lu\r\n",
                    log_file != nullptr, (unsigned long)lines_written, (unsigned long)n_sec,
                    (unsigned long)trig_drdy, (unsigned long)enc_err[0], (unsigned long)enc_err[1], (unsigned long)enc_warn[0],
                    (unsigned long)enc_warn[1],
                    (unsigned long)imu_miss, (unsigned long)imu_bad, busy_max, (unsigned long)dropped);
+            printf("UIMU A=%lu/s (bad %lu) B=%lu/s (bad %lu)\r\n", (unsigned long)urate[0], (unsigned long)ubad[0],
+                   (unsigned long)urate[1], (unsigned long)ubad[1]);
             // footL/R = 這一秒收到幾包 (最大間隔 ms)；foot_bad = checksum 錯；foot_jit = ESP32→STM32 延遲抖動 (µs)
             printf("FOOT L=%lu (gap_max=%lums) R=%lu (gap_max=%lums) total L/R=%lu/%lu foot_bad=%lu foot_drop=%lu ",
                    (unsigned long)foot_n[0], (unsigned long)(foot_gap_max[0] / 1000), (unsigned long)foot_n[1],
@@ -907,26 +1263,38 @@ int main() {
                    (unsigned long)foot_bad, (unsigned long)foot_drop);
             if (foot_esp_n) printf("foot_jit=%ldus\r\n", (long)(lat_max - lat_min));
             else printf("foot_jit=- (ESP32 沒送時間戳)\r\n");
+
+            if (st == ST_IDLE) {
+                bool sd_ok = check_sd();
+                if (sd_ok) sd_error = false;
+                bool enc_ok = n_sec >= (uint32_t)READY_MIN_RATE && enc_err[0] + enc_err[1] <= n_sec / 20;
+                bool spi_ok = imu_ok && n_sec - imu_miss >= (uint32_t)READY_MIN_RATE;
+                bool u_ok[N_UIMU];
+                for (int k = 0; k < N_UIMU; k++) u_ok[k] = urate[k] >= (uint32_t)READY_MIN_RATE;
+                bool foot_ok = foot_n[0] > 0 && foot_n[1] > 0;
+                ready = sd_ok && (!REQ_ENC || enc_ok) && (!REQ_SPI_IMU || spi_ok) &&
+                        (!REQ_UART_IMU || (u_ok[0] && u_ok[1])) && (!REQ_FOOT || foot_ok);
+                auto tag = [](bool ok, bool req) { return ok ? "OK" : (req ? "NG" : "-"); };
+                printf("READY=%d  enc=%s spiIMU=%s imuA=%s imuB=%s foot=%s SD=%s%s\r\n", ready, tag(enc_ok, REQ_ENC),
+                       tag(spi_ok, REQ_SPI_IMU), tag(u_ok[0], REQ_UART_IMU), tag(u_ok[1], REQ_UART_IMU),
+                       tag(foot_ok, REQ_FOOT), tag(sd_ok, true), ready ? "  -> 按 B1 開始 (先記錄 3 秒原點)" : "");
+            }
+
             n_sec = trig_drdy = imu_miss = imu_bad = busy_max = 0;
             for (int i = 0; i < N_ENC; i++) enc_err[i] = enc_warn[i] = 0;
             foot_n[0] = foot_n[1] = foot_gap_max[0] = foot_gap_max[1] = foot_esp_n = 0;
         }
 
-        // B1：50ms 消抖，按下切換 停止 / 開新檔
+        // B1 (50ms 消抖)，放開時動作：IDLE 且準備好 → 開始 (原點 3 秒 → 測量)；紀錄中 → 停止
         bool pressed = user_button.read() == 0;
-        // B1：短按 (放開時) 切換 停止 / 開新檔；按住 3 秒 = encoder 歸零
         if (pressed != button_prev && now - button_t > 50000) {
             button_prev = pressed;
             button_t = now;
-            if (!pressed && !long_done) {
-                if (log_file) stop_recording();
-                else start_recording();
+            if (!pressed) {
+                if (st != ST_IDLE) stop_run();
+                else if (ready) start_run();
+                else printf("還沒準備好 (LD2 沒亮)，看 READY 那一行哪一項是 NG；要強制開始請在序列埠送 'g'\r\n");
             }
-            long_done = false;
-        }
-        if (pressed && button_prev && !long_done && now - button_t > 3000000) {
-            long_done = true;
-            request_zero();
         }
 
         if (console->readable()) {
@@ -936,8 +1304,8 @@ int main() {
                     int div = ch == 's' ? 10 : 2;
                     live_div = live_div == div ? 0 : div;
                 }
-                else if (ch == 'g') start_recording();
-                else if (ch == 'x') stop_recording();
+                else if (ch == 'g') start_run();
+                else if (ch == 'x') stop_run();
                 else if (ch == 'z') request_zero();
                 else if (ch == 'i' && !imu_ok) {
                     // 重新初始化 IMU (換 IMU 後不用重開機)；成功就改用 DRDY 觸發
@@ -953,19 +1321,15 @@ int main() {
             }
         }
 
-        // LED：紀錄中慢閃、停止恆亮、SD 錯誤快閃
-        if (log_file) {
-            if (now - last_led >= 500000) {
-                led = !led;
-                last_led = now;
-            }
-        } else if (sd_error) {
-            if (now - last_led >= 100000) {
+        // LD2：沒準備好 = 熄滅、準備好 = 恆亮、原點 3 秒 = 快閃、測量中 = 慢閃
+        if (st == ST_ORIGIN || st == ST_MEASURE) {
+            uint64_t half = st == ST_ORIGIN ? 100000 : 500000;
+            if (now - last_led >= half) {
                 led = !led;
                 last_led = now;
             }
         } else {
-            led = 1;
+            led = ready ? 1 : 0;
         }
     }
 }
