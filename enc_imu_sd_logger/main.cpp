@@ -115,7 +115,10 @@ DigitalOut imu_cs(PB_1, 1);
 InterruptIn imu_drdy(PC_8, PullDown);
 const int IMU_SPI_FREQ = 1000000;
 
-const int SD_SPI_FREQ = 4000000;  // 杜邦線太長、mount 失敗時改 1000000
+// SPI3 在 APB1 (45MHz) 只能除 2 的次方：12MHz → 實際 11.25MHz (原本 4MHz → 實際只有 2.8MHz)。
+// 2026-11-06 實測：2.8MHz 寫檔佔主執行緒 ~470ms/s (SD 卡一慢就塞滿佇列 dropped)，11.25MHz ~300ms/s。
+// 杜邦線太長、mount 失敗或 CSV 出現亂碼時改 8000000 (5.6MHz) 或 1000000
+const int SD_SPI_FREQ = 12000000;
 SDBlockDevice sd(PC_12, PC_11, PC_10, PD_2, SD_SPI_FREQ);  // mosi, miso, sclk, cs (SPI3)
 FATFileSystem fs("fs");
 
@@ -317,6 +320,7 @@ struct Sample {
 };
 Mail<Sample, 200> mail;  // 2 秒緩衝 (SD 卡偶爾卡 100ms 以上)
 volatile uint32_t dropped = 0;
+volatile uint32_t q_depth = 0, q_max = 0;  // 佇列目前 / 這一秒最多積了幾筆 (到 200 就會 dropped)
 // 紀錄狀態：main 執行緒設定 (先設 origin_end_us 再設 rec_on)，取樣執行緒依週期開始時間決定 phase
 volatile bool rec_on = false;
 volatile uint64_t origin_end_us = 0;
@@ -457,17 +461,36 @@ void parse_measurement(const uint8_t* buf, int len, ImuData& s) {
     }
 }
 
-// ---------------- UART IMU (同 imu_uart_dual_100hz 測試程式) ----------------
-// 中斷裡逐 byte 解析 Xbus 封包：FA FF MID LEN payload CHECKSUM (FF + MID + LEN + payload + CHECKSUM 低 8 bit = 0)
-// 取樣執行緒每個週期用 fetch() 拿最新一筆
+// ---------------- UART IMU ----------------
+// 921600 baud 每 10.8us 一個 byte，STM32 USART 沒有 FIFO：用 RX 中斷逐 byte 收的話，只要其他中斷 / critical section
+// 擋住 >10us 就會 overrun 掉 byte (實測跟 encoder / SPI IMU / SD 一起跑時掉 ~3% byte，大部分封包 checksum 錯)。
+// 所以改成 DMA 循環接收 (硬體直接搬進 RAM，不怕中斷延遲)，再用 IDLE-line 中斷 (每包收完、線路空閒 1 byte 時間)
+// 把 DMA buffer 裡的新 byte 拿出來解析 Xbus 封包：FA FF MID LEN payload CHECKSUM (FF+MID+LEN+payload+CHECKSUM 低 8 bit = 0)。
+// 每個 byte 的時間 = 處理當下時間 − 之後還有幾個 byte × 每 byte 傳輸時間，所以中斷晚到不影響時間戳。
+// 取樣執行緒每個週期用 fetch() 拿最新一筆 (fetch 也會先把 buffer 處理完)
+//   USART3_RX = DMA1 Stream1 Channel4、UART4_RX = DMA1 Stream2 Channel4 (RM0390 Table 28；mbed 沒用到這兩個 stream)
 class MtiUart {
 public:
     volatile uint32_t rx_bytes = 0, pkt_ok = 0, pkt_bad = 0;
 
-    MtiUart(PinName tx, PinName rx, int baud) : serial(tx, rx, baud) {}
+    MtiUart(PinName tx, PinName rx, int baud, USART_TypeDef* usart, DMA_Stream_TypeDef* dma, uint32_t dma_ch,
+            IRQn_Type irqn, int slot)
+        : serial(tx, rx, baud), usart(usart), dma(dma), dma_ch(dma_ch), irqn(irqn), slot(slot),
+          byte_ns(10000000000ULL / baud) {}
 
-    void start() { serial.attach(callback(this, &MtiUart::rx_isr), SerialBase::RxIrq); }
-    void stop() { serial.attach(nullptr, SerialBase::RxIrq); }
+    void start() {
+        if (!dma_on) init_dma();
+        core_util_critical_section_enter();
+        rd = (DMA_BUF - dma->NDTR) & (DMA_BUF - 1);  // 丟掉停止期間收到的 byte，重新同步
+        state = S_PRE;
+        core_util_critical_section_exit();
+        usart->CR1 |= USART_CR1_IDLEIE;
+        running = true;
+    }
+    void stop() {
+        running = false;
+        usart->CR1 &= ~USART_CR1_IDLEIE;
+    }
 
     // 送無資料的指令 (例如 0x10 GoToMeasurement)
     void send_cmd(uint8_t m) {
@@ -478,6 +501,7 @@ public:
     // 複製最新一筆；d.n_new / d.bad = 上次呼叫到現在的新封包數 / 錯誤封包數，t = 最新封包第一個 byte 的時間
     void fetch(ImuData& d, uint64_t& t) {
         core_util_critical_section_enter();
+        if (running) drain(now_us());
         d = latest;
         t = latest_t;
         uint32_t n = pkt_ok - fetched_ok, b = pkt_bad - fetched_bad;
@@ -488,8 +512,77 @@ public:
         d.bad = b > 255 ? 255 : b;
     }
 
+    static void isr_slot0() { inst[0]->on_irq(); }
+    static void isr_slot1() { inst[1]->on_irq(); }
+
 private:
-    UnbufferedSerial serial;
+    static const uint32_t DMA_BUF = 512;  // 2 的次方；約 7 包，IDLE 中斷每包都會清
+    static MtiUart* inst[2];
+    UnbufferedSerial serial;  // 只用來設定腳位 / 鮑率和送指令 (TX 是 polling)，不掛 RX callback
+    USART_TypeDef* usart;
+    DMA_Stream_TypeDef* dma;
+    uint32_t dma_ch;
+    IRQn_Type irqn;
+    int slot;
+    uint32_t byte_ns;  // 一個 byte (10 bit) 的傳輸時間
+    volatile uint8_t dma_buf[DMA_BUF];
+    uint32_t rd = 0;
+    bool dma_on = false;
+    volatile bool running = false;
+
+    void init_dma() {
+        // 沒掛 RX callback 時 mbed 不會鎖 deep sleep；deep sleep 會停掉 USART / DMA 時脈
+        sleep_manager_lock_deep_sleep();
+        __HAL_RCC_DMA1_CLK_ENABLE();
+        dma->CR &= ~DMA_SxCR_EN;
+        while (dma->CR & DMA_SxCR_EN) {}
+        // 清掉這個 stream 的旗標 (LIFCR: stream0~3、HIFCR: stream4~7)
+        uint32_t idx = ((uint32_t)dma - (uint32_t)DMA1_Stream0) / 0x18;
+        static const uint8_t shift[4] = {0, 6, 16, 22};
+        if (idx < 4) DMA1->LIFCR = 0x3Du << shift[idx];
+        else DMA1->HIFCR = 0x3Du << shift[idx - 4];
+        dma->PAR = (uint32_t)&usart->DR;
+        dma->M0AR = (uint32_t)dma_buf;
+        dma->NDTR = DMA_BUF;
+        dma->FCR = 0;  // direct mode
+        dma->CR = (dma_ch << DMA_SxCR_CHSEL_Pos) | DMA_SxCR_PL_1 | DMA_SxCR_MINC | DMA_SxCR_CIRC;  // 週邊 -> 記憶體, 8 bit
+        dma->CR |= DMA_SxCR_EN;
+        usart->CR3 |= USART_CR3_DMAR;
+        inst[slot] = this;
+        NVIC_SetVector(irqn, slot == 0 ? (uint32_t)&isr_slot0 : (uint32_t)&isr_slot1);
+        NVIC_ClearPendingIRQ(irqn);
+        // 優先權比足底 UART (USART1，mbed 預設 0) 低，足底的 RX 中斷可以插隊
+        NVIC_SetPriority(irqn, 2);
+        NVIC_EnableIRQ(irqn);
+        dma_on = true;
+    }
+
+    void on_irq() {
+        uint32_t sr = usart->SR;
+        if (sr & USART_SR_IDLE) {
+            (void)usart->DR;  // SR 再讀 DR 才會清 IDLE (此時 RX 是空的，資料已被 DMA 拿走)
+            if (running) drain(now_us());
+        }
+    }
+
+    // 處理 DMA buffer 裡還沒解析的 byte；t = 現在時間。呼叫端要確保不會跟 ISR 同時跑。
+    // 這段在中斷 / critical section 裡跑，要很短 (會擋住足底 UART 中斷，115200 只能擋 ~170us)：
+    // 只有封包開頭 0xFA 才算時間戳 (32 bit 整數)，其他 byte 只跑狀態機
+    void drain(uint64_t t) {
+        uint32_t wr = (DMA_BUF - dma->NDTR) & (DMA_BUF - 1);
+        uint32_t n = (wr - rd) & (DMA_BUF - 1);
+        uint32_t r = rd;
+        for (uint32_t rem = n; rem > 0; rem--) {
+            uint8_t b = dma_buf[r];
+            r = (r + 1) & (DMA_BUF - 1);
+            if (b == 0xFA && (state == S_PRE || state == S_BID))
+                t_start = t - (rem * byte_ns) / 1000;  // 這個 byte 收完的大約時間
+            feed(b);
+        }
+        rd = r;
+        rx_bytes += n;
+    }
+
     ImuData latest = {};
     uint64_t latest_t = 0, t_start = 0;
     uint32_t fetched_ok = 0, fetched_bad = 0;
@@ -497,15 +590,14 @@ private:
     uint8_t mid = 0, len = 0, idx = 0, sum = 0;
     uint8_t buf[256];
 
-    void feed(uint8_t b, uint64_t t) {
+    void feed(uint8_t b) {  // t_start 由 drain() 在 0xFA 時設定
         switch (state) {
             case S_PRE:
-                if (b == 0xFA) { t_start = t; state = S_BID; }
+                if (b == 0xFA) state = S_BID;
                 break;
             case S_BID:
                 if (b == 0xFF) { sum = b; state = S_MID; }
-                else if (b == 0xFA) t_start = t;
-                else state = S_PRE;
+                else if (b != 0xFA) state = S_PRE;
                 break;
             case S_MID: mid = b; sum += b; state = S_LEN; break;
             case S_LEN:
@@ -530,18 +622,11 @@ private:
         }
     }
 
-    void rx_isr() {
-        uint64_t t = now_us();
-        uint8_t c;
-        while (serial.readable()) {
-            if (serial.read(&c, 1) != 1) break;
-            rx_bytes++;
-            feed(c, t);
-        }
-    }
 };
+MtiUart* MtiUart::inst[2] = {nullptr, nullptr};
 
-MtiUart uimu[N_UIMU] = {{PB_10, PC_5, UIMU_BAUD[0]}, {PA_0, PA_1, UIMU_BAUD[1]}};
+MtiUart uimu[N_UIMU] = {{PB_10, PC_5, UIMU_BAUD[0], USART3, DMA1_Stream1, 4, USART3_IRQn, 0},
+                        {PA_0, PA_1, UIMU_BAUD[1], UART4, DMA1_Stream2, 4, UART4_IRQn, 1}};
 const char UIMU_NAME[N_UIMU] = {'A', 'B'};
 
 void read_imu(ImuData& s) {
@@ -728,6 +813,8 @@ void sample_loop() {
         if (p) {
             *p = s;
             mail.put(p);
+            uint32_t d = core_util_atomic_incr_u32(&q_depth, 1);
+            if (d > q_max) q_max = d;
         } else {
             dropped++;
         }
@@ -1122,6 +1209,7 @@ int main() {
     };
 
     bool button_prev = false;
+    uint32_t wr_sum_us = 0, wr_max_us = 0;
     uint64_t button_t = 0, last_status = now_us(), last_led = 0;
     uint32_t n_sec = 0, enc_err[N_ENC] = {}, enc_warn[N_ENC] = {}, imu_miss = 0, imu_bad = 0, trig_drdy = 0;
     uint16_t busy_max = 0;
@@ -1164,7 +1252,11 @@ int main() {
         Sample* s = mail.try_get_for(5ms);
         if (s) {
             if (log_file && s->phase != 0) {  // 按下開始之前還在佇列裡的週期 (phase 0) 不寫
+                uint64_t w0 = now_us();
                 write_sample(log_file, *s);
+                uint32_t w = (uint32_t)(now_us() - w0);
+                if (w > wr_max_us) wr_max_us = w;
+                wr_sum_us += w;
                 lines_written++;
             }
             if (st == ST_ORIGIN) {
@@ -1219,6 +1311,7 @@ int main() {
             trig_drdy += s->trig != 0;
             if (s->busy > busy_max) busy_max = s->busy;
             mail.free(s);
+            core_util_atomic_decr_u32(&q_depth, 1);
         }
 
         uint64_t now = now_us();
@@ -1239,7 +1332,15 @@ int main() {
         // 每秒：寫回 SD + 印狀態 + 檢查是否準備好
         if (now - last_status >= 1000000) {
             last_status = now;
+            uint64_t sy0 = now_us();
             sync_recording();
+            uint32_t sync_us = (uint32_t)(now_us() - sy0);
+            // 寫檔診斷：wr = 這一秒寫 CSV 花的總時間 / 單行最久；sync = fflush+fsync；q_max = 佇列最多積幾筆 (200 滿)
+            if (log_file)
+                printf("SD wr_sum=%lums wr_max=%lums sync=%lums q_max=%lu\r\n", (unsigned long)(wr_sum_us / 1000),
+                       (unsigned long)(wr_max_us / 1000), (unsigned long)(sync_us / 1000), (unsigned long)q_max);
+            wr_sum_us = wr_max_us = 0;
+            q_max = q_depth;
             uint32_t urate[N_UIMU], ubad[N_UIMU], ubytes[N_UIMU];
             for (int k = 0; k < N_UIMU; k++) {
                 uint32_t ok = uimu[k].pkt_ok, bad = uimu[k].pkt_bad, by = uimu[k].rx_bytes;
