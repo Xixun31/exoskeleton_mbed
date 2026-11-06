@@ -1125,7 +1125,7 @@ int main() {
     uint64_t button_t = 0, last_status = now_us(), last_led = 0;
     uint32_t n_sec = 0, enc_err[N_ENC] = {}, enc_warn[N_ENC] = {}, imu_miss = 0, imu_bad = 0, trig_drdy = 0;
     uint16_t busy_max = 0;
-    uint32_t uimu_prev_ok[N_UIMU] = {}, uimu_prev_bad[N_UIMU] = {};
+    uint32_t uimu_prev_ok[N_UIMU] = {}, uimu_prev_bad[N_UIMU] = {}, uimu_prev_bytes[N_UIMU] = {};
     // 足底每秒統計：收到幾包、最大間隔、ESP32→STM32 延遲的抖動 (max - min)
     uint32_t foot_n[2] = {}, foot_gap_max[2] = {}, foot_esp_n = 0;
     uint64_t foot_last_t[2] = {};
@@ -1240,13 +1240,15 @@ int main() {
         if (now - last_status >= 1000000) {
             last_status = now;
             sync_recording();
-            uint32_t urate[N_UIMU], ubad[N_UIMU];
+            uint32_t urate[N_UIMU], ubad[N_UIMU], ubytes[N_UIMU];
             for (int k = 0; k < N_UIMU; k++) {
-                uint32_t ok = uimu[k].pkt_ok, bad = uimu[k].pkt_bad;
+                uint32_t ok = uimu[k].pkt_ok, bad = uimu[k].pkt_bad, by = uimu[k].rx_bytes;
                 urate[k] = ok - uimu_prev_ok[k];
                 ubad[k] = bad - uimu_prev_bad[k];
+                ubytes[k] = by - uimu_prev_bytes[k];
                 uimu_prev_ok[k] = ok;
                 uimu_prev_bad[k] = bad;
+                uimu_prev_bytes[k] = by;
             }
             printf("STAT rec=%d lines=%lu rate=%lu imu_trig=%lu enc_err=%lu/%lu mag_warn=%lu/%lu imu_miss=%lu imu_bad=%lu busy_max=%uus "
                    "dropped=%lu\r\n",
@@ -1254,8 +1256,17 @@ int main() {
                    (unsigned long)trig_drdy, (unsigned long)enc_err[0], (unsigned long)enc_err[1], (unsigned long)enc_warn[0],
                    (unsigned long)enc_warn[1],
                    (unsigned long)imu_miss, (unsigned long)imu_bad, busy_max, (unsigned long)dropped);
-            printf("UIMU A=%lu/s (bad %lu) B=%lu/s (bad %lu)\r\n", (unsigned long)urate[0], (unsigned long)ubad[0],
-                   (unsigned long)urate[1], (unsigned long)ubad[1]);
+            // 每秒封包數 / 收到 byte 數 / 錯誤封包數。0 B/s = 沒接好 (TX/RX 接反、GND、供電)；
+            // 有 byte 但 0 包 = 鮑率不對 (UIMU_BAUD 跟 IMU 設定不同)
+            printf("UIMU A=%lu/s %luB/s (bad %lu) B=%lu/s %luB/s (bad %lu)", (unsigned long)urate[0],
+                   (unsigned long)ubytes[0], (unsigned long)ubad[0], (unsigned long)urate[1], (unsigned long)ubytes[1],
+                   (unsigned long)ubad[1]);
+            for (int k = 0; k < N_UIMU; k++) {
+                if (urate[k] >= (uint32_t)READY_MIN_RATE) continue;
+                if (ubytes[k] == 0) printf("  %c:沒收到任何byte(檢查接線)", UIMU_NAME[k]);
+                else if (urate[k] == 0) printf("  %c:有byte沒封包(鮑率%d不對?)", UIMU_NAME[k], UIMU_BAUD[k]);
+            }
+            printf("\r\n");
             // footL/R = 這一秒收到幾包 (最大間隔 ms)；foot_bad = checksum 錯；foot_jit = ESP32→STM32 延遲抖動 (µs)
             printf("FOOT L=%lu (gap_max=%lums) R=%lu (gap_max=%lums) total L/R=%lu/%lu foot_bad=%lu foot_drop=%lu ",
                    (unsigned long)foot_n[0], (unsigned long)(foot_gap_max[0] / 1000), (unsigned long)foot_n[1],
