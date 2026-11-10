@@ -128,7 +128,7 @@ UnbufferedSerial foot_uart(PA_9, PA_10, FOOT_BAUD);  // tx (不接), rx
 
 // UART IMU：A = USART3 (PB_10 TX, PC_5 RX)、B = UART4 (PA_0 TX, PA_1 RX)。鮑率要跟各 IMU 的設定一樣
 const int N_UIMU = 2;
-const int UIMU_BAUD[N_UIMU] = {921600, 921600};
+const int UIMU_BAUD[N_UIMU] = {115200, 115200};
 
 // 「準備好」(LD2 恆亮) 需要哪些裝置正常；今天沒接的裝置改 false
 const bool REQ_ENC = true, REQ_SPI_IMU = true, REQ_UART_IMU = true, REQ_FOOT = true;
